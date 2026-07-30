@@ -972,15 +972,20 @@ def callInMainThread(func, *args, **kwargs):
                 _CMIT_TIMER.callback.append(_drain_cmit_queue)
             except Exception:
                 _CMIT_TIMER = None
-        timer_ok = _CMIT_TIMER is not None
-    if timer_ok:
-        try: _CMIT_TIMER.start(50, True)
-        except Exception: pass
-    else:
-        try:
-            from twisted.internet import reactor
-            reactor.callFromThread(_drain_cmit_queue)
-        except Exception: pass
+        # Start the timer INSIDE the lock
+        if _CMIT_TIMER is not None:
+            try:
+                _CMIT_TIMER.start(50, True)
+            except Exception:
+                pass
+            return  # Timer started, we're done
+    
+    # Only reach here if _CMIT_TIMER is None (fallback to reactor)
+    try:
+        from twisted.internet import reactor
+        reactor.callFromThread(_drain_cmit_queue)
+    except Exception:
+        pass
 
 # ─── Local HTTP Proxy (HiSilicon SSL Shield) ─────────────────────────────────
 _PROXY_PORT = 19888
@@ -2152,7 +2157,7 @@ class AdvancedArabicPlayerDetail(Screen):
         self._poster_loaded = False
         self._raw_title = ""
         self._closed = False
-        self._proxy_warning_shown = False
+        self._proxy_warning_shown = False  # <-- FIX: Add this line
 
         self._extract_lock = threading.Lock()
         self._extract_token = 0
@@ -2820,35 +2825,51 @@ def _build_remote_play_candidates(url):
         legacy_proxied = ""
 
     is_hls = any(x in plain_url.lower() for x in (".m3u8", "master.txt", "/hls", "/playlist"))
+    has_exteplayer = os.path.exists("/usr/bin/exteplayer3")
 
+    # ─── OPTIMIZED ORDER: FAST PLAYERS FIRST, SLOWER PLAYERS SECOND, PROXY LAST ──
     if is_hls:
+        # 1st: Native HLS (4097) - FASTEST for HLS
         add_candidate(4097, plain_url, "4097 مباشر HLS")
+        add_candidate(4097, url, "4097 + headers HLS")
+        
+        # 2nd: Native Movie Player (8193) - FAST
+        add_candidate(8193, plain_url, "8193 مباشر")
+        add_candidate(5001, plain_url, "5001 مباشر")
+        
+        # 3rd: exteplayer3 (5002) - SLOWER but more compatible
+        if has_exteplayer:
+            add_candidate(5002, plain_url, "5002 exteplayer3")
+            add_candidate(5002, url, "5002 exteplayer3 + headers")
+        
+        # LAST: Proxy fallbacks
         if proxied:
             add_candidate(4097, proxied, "4097 + proxy HLS", True)
-        add_candidate(4097, url, "4097 + headers HLS")
-        add_candidate(8193, plain_url, "8193 مباشر")
-        if proxied:
-            add_candidate(8193, proxied, "8193 + proxy", True)
+            add_candidate(5001, proxied, "5001 + proxy", True)
+            if has_exteplayer:
+                add_candidate(5002, proxied, "5002 exteplayer3 + proxy", True)
+        if legacy_proxied:
+            add_candidate(4097, legacy_proxied, "4097 + proxy قديم", True)
     else:
+        # 1st: HTTP Player (5001) - FASTEST for MP4
+        add_candidate(5001, plain_url, "5001 مباشر")
+        add_candidate(4097, plain_url, "4097 مباشر")
+        add_candidate(8193, plain_url, "8193 مباشر")
+        add_candidate(4097, url, "4097 + headers")
+        
+        # 2nd: exteplayer3 (5002) - SLOWER but more compatible
+        if has_exteplayer:
+            add_candidate(5002, plain_url, "5002 exteplayer3")
+            add_candidate(5002, url, "5002 exteplayer3 + headers")
+        
+        # LAST: Proxy fallbacks
         if proxied:
             add_candidate(5001, proxied, "5001 + proxy", True)
-        add_candidate(5001, plain_url, "5001 مباشر")
-        add_candidate(8193, plain_url, "8193 مباشر")
-        if proxied:
-            add_candidate(8193, proxied, "8193 + proxy", True)
-        add_candidate(4097, plain_url, "4097 مباشر")
-        if proxied:
             add_candidate(4097, proxied, "4097 + proxy", True)
-        add_candidate(4097, url, "4097 + headers")
-    if legacy_proxied:
-        add_candidate(4097, legacy_proxied, "4097 + proxy قديم", True)
-
-    if os.path.exists("/usr/bin/exteplayer3"):
-        if plain_url.startswith("http://") or plain_url.startswith("https://"):
-            add_candidate(5002, plain_url, "5002 مباشر")
-            if proxied:
-                add_candidate(5002, proxied, "5002 + proxy", True)
-        add_candidate(5002, url, "5002 + headers")
+            if has_exteplayer:
+                add_candidate(5002, proxied, "5002 exteplayer3 + proxy", True)
+        if legacy_proxied:
+            add_candidate(4097, legacy_proxied, "4097 + proxy قديم", True)
 
     return candidates
 
