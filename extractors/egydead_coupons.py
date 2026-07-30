@@ -404,12 +404,20 @@ class EgyDeadCouponsExtractor(BaseExtractor):
         title = ""
         title_match = re.search(r'<meta[^>]+property=["\']og:title["\'][^>]+content=["\']([^"\']+)["\']', html, re.I)
         if title_match:
-            title = self._clean_title(title_match.group(1))
+            # NOTE: the site appends a bilingual branding suffix
+            # "egydead | ايجي ديد" to every og:title. Splitting on "|"
+            # alone isn't enough - "egydead" sits *before* the pipe, so it's
+            # left dangling on the end after the split.
+            raw = title_match.group(1).split('|')[0]
+            raw = re.sub(r'\s*egydead\s*$', '', raw, flags=re.I)
+            title = self._clean_title(raw)
 
         if not title:
             title_match = re.search(r'<title>(.*?)</title>', html, re.I)
             if title_match:
-                title = self._clean_title(title_match.group(1).split('|')[0])
+                raw = title_match.group(1).split('|')[0]
+                raw = re.sub(r'\s*egydead\s*$', '', raw, flags=re.I)
+                title = self._clean_title(raw)
 
         poster = ""
         poster_match = re.search(r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']', html, re.I)
@@ -613,7 +621,19 @@ class EgyDeadCouponsExtractor(BaseExtractor):
 
             servers = self._extract_watch_servers(html, final_url or url)
             if not servers:
-                log("EgyDeadCoupons: no servers on initial load, retrying with View=1 POST")
+                # NOTE: this site reveals its server list on a dedicated
+                # {url}/watch sub-page, not via a View=1 POST retry on the
+                # same URL (confirmed against a live snapshot: 0 servers on
+                # the movie page itself, 12 correctly found on its /watch
+                # page). Try that first; keep the old POST retry as a
+                # last-resort fallback in case some page types still use it.
+                watch_url = (final_url or url).rstrip("/") + "/watch"
+                log("EgyDeadCoupons: no servers on initial load, fetching watch page: {}".format(watch_url))
+                watch_html, watch_final_url = self._fetch(watch_url)
+                if watch_html:
+                    servers = self._extract_watch_servers(watch_html, watch_final_url or watch_url)
+            if not servers:
+                log("EgyDeadCoupons: still no servers, retrying with View=1 POST")
                 post_html, post_final_url = self._fetch(url, post_data={"View": "1"})
                 if post_html:
                     servers = self._extract_watch_servers(post_html, post_final_url or url)
@@ -660,7 +680,17 @@ class EgyDeadCouponsExtractor(BaseExtractor):
 
         servers = self._extract_watch_servers(html, final_url or url)
         if not servers:
-            log("EgyDeadCoupons: no servers on initial load, retrying with View=1 POST")
+            # See the episode branch above for why: servers live on a
+            # dedicated {url}/watch sub-page, confirmed against a live
+            # snapshot (0 servers directly on the movie page, 12 found
+            # correctly on its /watch page).
+            watch_url = (final_url or url).rstrip("/") + "/watch"
+            log("EgyDeadCoupons: no servers on initial load, fetching watch page: {}".format(watch_url))
+            watch_html, watch_final_url = self._fetch(watch_url)
+            if watch_html:
+                servers = self._extract_watch_servers(watch_html, watch_final_url or watch_url)
+        if not servers:
+            log("EgyDeadCoupons: still no servers, retrying with View=1 POST")
             post_html, post_final_url = self._fetch(url, post_data={"View": "1"})
             if post_html:
                 servers = self._extract_watch_servers(post_html, post_final_url or url)

@@ -61,6 +61,35 @@ class ArablionzExtractor(BaseExtractor):
         results = []
         seen = set()
 
+        # Strategy 0: arablionz.live's actual card markup —
+        # <div class="BlockItem"><a href="URL">...<img ... data-image="POSTER" alt="TITLE">...</a></div>
+        # Posters are lazy-loaded: the raw `src` is a "load.gif" placeholder
+        # and the real image lives in `data-image`, so that must be checked first.
+        for m in re.finditer(
+            r'<div class="BlockItem"><a href="([^"]+)">(.*?)</a></div>',
+            html or "", re.S
+        ):
+            link = self._full_url(m.group(1))
+            card = m.group(2)
+            if not link or link in seen:
+                continue
+
+            img_m = (
+                re.search(r'data-image=["\']([^"\']+)["\']', card, re.I) or
+                re.search(r'<img[^>]+(?:data-src|data-lazy-src|src)=["\']([^"\']+)["\']', card, re.I)
+            )
+            title_m = (
+                re.search(r'<img[^>]+alt=["\']([^"\']+)["\']', card, re.I) or
+                re.search(r'<h4[^>]*>([^<]+)</h4>', card, re.I)
+            )
+            if title_m:
+                seen.add(link)
+                img = self._full_url(img_m.group(1)) if img_m else ""
+                results.append((link, img, self._clean_title(title_m.group(1))))
+
+        if results:
+            return results
+
         # Strategy 1: article or post-type containers
         for container in re.findall(
             r'<(?:article|div)[^>]+class="[^"]*(?:item|post|movie|entry|Box)[^"]*"[^>]*>(.*?)</(?:article|div)>',
@@ -267,22 +296,32 @@ class ArablionzExtractor(BaseExtractor):
             return result
 
         # Title
+        # NOTE: the page contains other <h1> tags before the real one (e.g. a
+        # hidden login-modal heading), so a bare '<h1>' fallback can grab the
+        # wrong text. Prefer the actual 'entry-title' heading, then <title>.
         title_m = (
+            re.search(r'<h1[^>]*class="[^"]*entry-title[^"]*"[^>]*>(.*?)</h1>', html, re.S | re.I) or
             re.search(r'<h1[^>]*class="[^"]*post-title[^"]*"[^>]*>(.*?)</h1>', html, re.S | re.I) or
-            re.search(r'<h1[^>]*>(.*?)</h1>', html, re.S | re.I) or
-            re.search(r'<meta[^>]+property="og:title"[^>]+content=["\']([^"\']+)["\']', html, re.I)
+            re.search(r'<meta[^>]+property="og:title"[^>]+content=["\']([^"\']+)["\']', html, re.I) or
+            re.search(r'<title>(.*?)</title>', html, re.S | re.I)
         )
         if title_m:
             result["title"] = self._clean_title(title_m.group(1))
 
         # Poster
+        # NOTE: arablionz.live renders the poster as a CSS background-image
+        # on <div class="poster" style="background-image: url(...)">, not an
+        # <img> tag, and doesn't set og:image. itemprop="thumbnailUrl" is a
+        # reliable secondary source.
         poster_m = (
+            re.search(r'<div[^>]*class="[^"]*\bposter\b[^"]*"[^>]*style="[^"]*background-image:\s*url\(([^)]+)\)', html, re.I) or
+            re.search(r'<meta[^>]+itemprop="thumbnailUrl"[^>]+content=["\']([^"\']+)["\']', html, re.I) or
             re.search(r'<img[^>]+class="[^"]*(?:poster|cover|img-fluid)[^"]*"[^>]+src=["\']([^"\']+)["\']', html, re.I) or
             re.search(r'<meta[^>]+property="og:image"[^>]+content=["\']([^"\']+)["\']', html, re.I) or
             re.search(r'<div[^>]*class="[^"]*poster[^"]*"[^>]*>.*?<img[^>]+src=["\']([^"\']+)["\']', html, re.S | re.I)
         )
         if poster_m:
-            result["poster"] = poster_m.group(1).replace("&amp;", "&")
+            result["poster"] = poster_m.group(1).strip("'\" ").replace("&amp;", "&")
 
         # Plot
         plot_m = (
@@ -302,47 +341,90 @@ class ArablionzExtractor(BaseExtractor):
 
         # ── Servers Extraction (FIXED for arablionz.live) ──
         seen_servers = set()
-        
-        # Look for server buttons with data-href attribute
-        # Pattern: <button class="btn-server" data-href="URL">السيرفر 1</button>
-        server_buttons = re.findall(
-            r'<button[^>]*class="[^"]*btn-server[^"]*"[^>]*data-href=["\']([^"\']+)["\'][^>]*>(.*?)</button>',
-            html, re.I | re.S
-        )
-        
-        if not server_buttons:
-            # Try alternative: any button with data-href
+
+        # NOTE: the server list is NOT present on the plain movie page at all
+        # - it's only rendered when the page is requested with ?watch=1
+        # appended (this is how the site's own "مشاهدة العرض" button works).
+        # Real markup: <button class="cwd-server-btn" data-server-url="URL">
+        #                <span class="cwd-server-name">السيرفر N</span></button>
+        watch_url = url + ("&watch=1" if "?" in url else "?watch=1")
+        watch_html, _ = fetch(watch_url, referer=url)
+        source_html = watch_html or html
+
+        for btn_m in re.finditer(
+            r'<button[^>]*class="[^"]*cwd-server-btn[^"]*"[^>]*>(.*?)</button>',
+            source_html, re.I | re.S
+        ):
+            btn_html = btn_m.group(0)
+            href_m = re.search(r'data-server-url=["\']([^"\']+)["\']', btn_html, re.I)
+            if not href_m:
+                continue
+            server_url = href_m.group(1).strip().replace("&amp;", "&")
+            if not server_url or server_url in seen_servers:
+                continue
+            seen_servers.add(server_url)
+
+            name_m = re.search(r'<span[^>]*class="[^"]*cwd-server-name[^"]*"[^>]*>([^<]+)</span>', btn_html, re.I)
+            name = name_m.group(1).strip() if name_m else "سيرفر {}".format(len(result["servers"]) + 1)
+
+            quality = self._extract_quality_from_url(server_url)
+            variants = extract_stream_all(server_url)
+            if variants:
+                for stream_url, quality_label in variants:
+                    result["servers"].append({
+                        "name":  "{} - {}".format(name, quality_label),
+                        "url":   stream_url,
+                        "type":  "direct",
+                        "quality": quality_label,
+                    })
+            else:
+                result["servers"].append({
+                    "name":  name,
+                    "url":   server_url,
+                    "type":  "embed",
+                    "quality": quality,
+                })
+
+        # Legacy fallback: older button/data-href layout, kept in case the
+        # site reverts or serves a different template for some pages.
+        if not result["servers"]:
             server_buttons = re.findall(
-                r'<button[^>]*data-href=["\']([^"\']+)["\'][^>]*>(.*?)</button>',
-                html, re.I | re.S
+                r'<button[^>]*class="[^"]*btn-server[^"]*"[^>]*data-href=["\']([^"\']+)["\'][^>]*>(.*?)</button>',
+                source_html, re.I | re.S
             )
-        
-        if not server_buttons:
-            # Try: a tags with data-href or href inside server containers
-            server_buttons = re.findall(
-                r'<a[^>]*data-href=["\']([^"\']+)["\'][^>]*>(.*?)</a>',
-                html, re.I | re.S
-            )
-        
-        if server_buttons:
+
+            if not server_buttons:
+                # Try alternative: any button with data-href
+                server_buttons = re.findall(
+                    r'<button[^>]*data-href=["\']([^"\']+)["\'][^>]*>(.*?)</button>',
+                    source_html, re.I | re.S
+                )
+
+            if not server_buttons:
+                # Try: a tags with data-href or href inside server containers
+                server_buttons = re.findall(
+                    r'<a[^>]*data-href=["\']([^"\']+)["\'][^>]*>(.*?)</a>',
+                    source_html, re.I | re.S
+                )
+
             for server_url, inner_html in server_buttons:
                 server_url = server_url.strip()
                 if not server_url or server_url in seen_servers:
                     continue
                 seen_servers.add(server_url)
-                
+
                 # Clean server name
                 name = re.sub(r'<[^>]+>', '', inner_html).strip()
                 if not name:
                     name = "سيرفر {}".format(len(result["servers"]) + 1)
-                
+
                 # If URL is relative, make it absolute
                 if server_url.startswith("/"):
                     server_url = self._full_url(server_url)
-                
+
                 # Try to extract quality from URL or context
                 quality = self._extract_quality_from_url(server_url)
-                
+
                 # Check for multiple quality variants
                 variants = extract_stream_all(server_url)
                 if variants:
@@ -365,7 +447,7 @@ class ArablionzExtractor(BaseExtractor):
         if not result["servers"]:
             for m in re.finditer(
                 r'<iframe[^>]+(?:src|data-src|data-lazy-src)=["\']([^"\']+)["\']',
-                html, re.I
+                source_html, re.I
             ):
                 iframe_url = m.group(1).strip()
                 if iframe_url.startswith("//"):
@@ -400,7 +482,7 @@ class ArablionzExtractor(BaseExtractor):
                 r'streamwish|filemoon|lulustream|ok\.ru|govid|savefiles|mxcontent|'
                 r'hgcloud|vidguard|fastvid|free-wd\.online)[^"\']+)'
                 r'["\']',
-                html, re.I
+                source_html, re.I
             ):
                 link = m.group(1)
                 if link in seen_servers:
@@ -434,7 +516,7 @@ class ArablionzExtractor(BaseExtractor):
                 r'data-url=["\']([^"\']+)["\']',
                 r'<source[^>]+src=["\']([^"\']+)["\']',
             ):
-                m = re.search(pat, html, re.I)
+                m = re.search(pat, source_html, re.I)
                 if m:
                     video_url = m.group(1)
                     quality = self._extract_quality_from_url(video_url)

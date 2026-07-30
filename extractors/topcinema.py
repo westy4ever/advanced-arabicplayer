@@ -22,13 +22,14 @@ class TopCinemaExtractor(BaseExtractor):
     """Extractor for TopCinema - topcinemaa.top"""
     
     DOMAINS = [
+        "https://topcinemaa.com/",
         "https://topcinemaa.top/",
         "https://topcinma.com/",
         "https://topcinema.vip/",
         "https://topcima.info/",
         "https://topcinma.red/",
     ]
-    VALID_HOST_MARKERS = ("topcinemaa.top", "topcinma.com", "topcinema.vip", "topcima.info", "topcinma.red", "topcinema", "topcinma", "topcima")
+    VALID_HOST_MARKERS = ("topcinemaa.com", "topcinemaa.top", "topcinma.com", "topcinema.vip", "topcima.info", "topcinma.red", "topcinema", "topcinma", "topcima")
     BLOCKED_HOST_MARKERS = ("alliance4creativity.com",)
     
     def __init__(self):
@@ -216,13 +217,22 @@ class TopCinemaExtractor(BaseExtractor):
         items = self._extract_blocks(html)
     
         next_url = None
-        m = re.search(r'<a[^>]+rel=["\']next["\'][^>]+href=["\']([^"\']+)["\']', html, re.I)
+        # NOTE: topcinema's own pagination <a> tags carry neither rel="next"
+        # nor class="next", and the "»" glyph is emitted as the HTML entity
+        # &raquo; (not the literal unicode character) — so all of those used
+        # to fail silently. The <link rel="next"> tag in <head> is the most
+        # reliable source when present; the &raquo;-aware anchor pattern is
+        # the fallback that matches topcinema's actual pagination markup:
+        # <div class="paginate"><ul class="page-numbers">...<li><a href="...">&raquo;</a></li>
+        m = re.search(r'<link[^>]+rel=["\']next["\'][^>]+href=["\']([^"\']+)["\']', html, re.I)
+        if not m:
+            m = re.search(r'<a[^>]+rel=["\']next["\'][^>]+href=["\']([^"\']+)["\']', html, re.I)
         if not m:
             m = re.search(r'<a[^>]+href=["\']([^"\']+)["\'][^>]+rel=["\']next["\']', html, re.I)
         if not m:
             m = re.search(r'<a[^>]+class=["\'][^"\']*\bnext\b[^"\']*["\'][^>]+href=["\']([^"\']+)["\']', html, re.I)
         if not m:
-            m = re.search(r'<a[^>]+href=["\']([^"\']+)["\'][^>]*>(?:(?!</a>).)*?»(?:(?!</a>).)*?</a>', html, re.I | re.S)
+            m = re.search(r'<a[^>]+href=["\']([^"\']+)["\'][^>]*>\s*(?:&raquo;|»)\s*</a>', html, re.I | re.S)
         if m:
             next_url = self._normalize_url(m.group(1))
         if next_url:

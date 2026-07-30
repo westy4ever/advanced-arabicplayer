@@ -8,7 +8,9 @@ Inherits from BaseExtractor for common functionality.
 
 import re
 import sys
-from .base import BaseExtractor, fetch, log
+import time
+import threading
+from .base import BaseExtractor, fetch, log, _correct_stream_url, _extract_quality_from_streamruby_url
 from urllib.parse import urljoin, urlparse, quote_plus, quote, unquote
 from html import unescape as html_unescape
 
@@ -21,6 +23,12 @@ else:
     from HTMLParser import HTMLParser
     html_unescape = HTMLParser().unescape
 
+# ─── Process-wide base-domain cache ──────────────────────────────────────────
+_BASE_CACHE_TTL   = 300   # 5 minutes (reduced from 30 for faster token refresh)
+_PROBE_COOLDOWN   = 30    # 30 seconds
+_base_cache = {"url": None, "resolved_at": 0, "probed_at": 0}
+_base_cache_lock = threading.Lock()
+
 
 class EgyDeadExtractor(BaseExtractor):
     """Extractor for EgyDead main domain (tv10.egydead.live)."""
@@ -28,8 +36,15 @@ class EgyDeadExtractor(BaseExtractor):
     MAIN_URL = "https://tv10.egydead.live/"
     
     DOMAINS = [
+        "https://tv10.egydead.live/",
+        "https://tv9.egydead.live/",
+        "https://tv8.egydead.live/",
+        "https://tv7.egydead.live/",
+        "https://tv.egydead.live/",
+        "https://a46.egydead.live/",
+        "https://www.egydead.live/",
+        "https://egydead.live/",
         "https://egydead.com/",
-        "https://egydead.fyi/",
         "https://egydead.media/",
         "https://egydead.space/",
         "https://egydead.video/",
@@ -37,17 +52,9 @@ class EgyDeadExtractor(BaseExtractor):
         "https://egydead.center/",
         "https://egydead.pics/",
         "https://egydead.org/",
-        "https://egydead.live/",
-        "https://tv.egydead.live/",
-        "https://tv4.egydead.live/",
-        "https://tv7.egydead.live/",
-        "https://tv8.egydead.live/",
-        "https://tv9.egydead.live/",
-        "https://tv10.egydead.live/",
-        "https://a46.egydead.live/",
-        "https://www.egydead.live/",
-        "https://egydead.lat/",
         "https://x7k9f.sbs/",
+        "https://egydead.fyi/",
+        "https://egydead.lat/",
     ]
     
     VALID_HOST_MARKERS = ("egydead", "x7k9f.sbs")
@@ -109,25 +116,73 @@ class EgyDeadExtractor(BaseExtractor):
         return "{}://{}/".format(parts.scheme or "https", parts.netloc)
     
     def _get_base(self):
+        """Get the base URL with improved caching and fallback."""
         if self._resolved_base:
             return self._resolved_base
+
+        now = time.time()
+        with _base_cache_lock:
+            cached_url  = _base_cache["url"]
+            resolved_at = _base_cache["resolved_at"]
+            probed_at   = _base_cache["probed_at"]
+
+        if cached_url and (now - resolved_at) < _BASE_CACHE_TTL:
+            log("EgyDead: reusing cached base {} (resolved {}s ago)".format(cached_url, int(now - resolved_at)))
+            self._resolved_base = cached_url
+            self.main_url = cached_url
+            return cached_url
+
+        if cached_url and (now - probed_at) < _PROBE_COOLDOWN:
+            log("EgyDead: skipping full re-probe (cooldown), reusing {} for now".format(cached_url))
+            self._resolved_base = cached_url
+            self.main_url = cached_url
+            return cached_url
+
+        # Try each domain with improved headers
         for domain in self.DOMAINS:
             log("EgyDead: probing {}".format(domain))
-            html, final_url = fetch(domain, referer=domain)
+            
+            # Add proper headers for probing
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+                "Accept-Language": "ar-EG,ar;q=0.9,en;q=0.8",
+                "Accept-Encoding": "gzip, deflate, br",
+                "Connection": "keep-alive",
+                "Upgrade-Insecure-Requests": "1",
+                "Sec-Fetch-Dest": "document",
+                "Sec-Fetch-Mode": "navigate",
+                "Sec-Fetch-Site": "none",
+                "Sec-Fetch-User": "?1",
+            }
+            
+            html, final_url = fetch(domain, referer=domain, extra_headers=headers)
             final_url = final_url or domain
+            
             if not self._is_valid_site_url(final_url):
                 log("EgyDead: unexpected host after redirect {}".format(final_url))
                 continue
+                
             if self._is_blocked_page(html, final_url):
                 log("EgyDead: blocked {}".format(final_url))
                 continue
+                
             if html and self._looks_like_egydead_page(html):
                 self._resolved_base = self._site_root(final_url)
                 self.main_url = self._resolved_base
+                with _base_cache_lock:
+                    _base_cache["url"] = self._resolved_base
+                    _base_cache["resolved_at"] = now
+                    _base_cache["probed_at"] = now
                 log("EgyDead: selected base {}".format(self._resolved_base))
                 return self._resolved_base
+                
+        # Fallback to first domain
         self._resolved_base = self.DOMAINS[0]
         self.main_url = self._resolved_base
+        with _base_cache_lock:
+            _base_cache["url"] = self._resolved_base
+            _base_cache["probed_at"] = now
         log("EgyDead: all probes failed, falling back to {}".format(self._resolved_base))
         return self._resolved_base
     
@@ -229,14 +284,18 @@ class EgyDeadExtractor(BaseExtractor):
     def _extract_quality_from_url(self, url):
         if not url:
             return ""
+        # Correct the URL first
+        url = _correct_stream_url(url)
         lower = url.lower()
-        if "1080" in lower or "fhd" in lower or "hd1080" in lower or "-f3-" in lower or "_o" in lower or "_x" in lower:
+        
+        # Check for streamruby quality patterns
+        if "_o" in lower or "1080" in lower or "fhd" in lower or "hd1080" in lower or "-f3-" in lower or "_o" in lower or "_x" in lower:
             return "1080p"
-        elif "720" in lower or "hd" in lower or "hd720" in lower or "-f2-" in lower or "_h" in lower:
+        elif "_h" in lower or "720" in lower or "hd" in lower or "hd720" in lower or "-f2-" in lower or "_h" in lower:
             return "720p"
-        elif "480" in lower or "-f1-" in lower or "_n" in lower:
+        elif "_n" in lower or "480" in lower or "-f1-" in lower or "_n" in lower:
             return "480p"
-        elif "360" in lower or "_l" in lower:
+        elif "_l" in lower or "360" in lower or "_l" in lower:
             return "360p"
         elif "master.m3u8" in lower or "playlist" in lower:
             return "HD"
@@ -408,6 +467,16 @@ class EgyDeadExtractor(BaseExtractor):
                 next_url = "https:" + raw_href
             else:
                 next_url = urljoin(current_url, raw_href)
+
+            # Rewrite to currently resolved base
+            try:
+                parsed_next = urlparse(next_url)
+                parsed_base = urlparse(self._get_base())
+                if parsed_next.netloc and parsed_base.netloc and parsed_next.netloc != parsed_base.netloc:
+                    next_url = parsed_next._replace(scheme=parsed_base.scheme, netloc=parsed_base.netloc).geturl()
+            except Exception:
+                pass
+
             if next_url and next_url != current_url:
                 return {
                     "title": "➡️ Next Page",
@@ -687,9 +756,9 @@ class EgyDeadExtractor(BaseExtractor):
     def extract_stream(self, url):
         """
         Resolve a server URL to a playable stream.
-        Enhanced to handle all EgyDead CDN patterns including .txt manifests.
+        Enhanced to handle all EgyDead CDN patterns including .txt and .woff2 manifests.
         """
-        from .base import resolve_streamruby, resolve_host, resolve_mixdrop, resolve_doodstream, get_last_quality_variants, get_synthesized_variants, extract_stream as base_extract_stream
+        from .base import resolve_streamruby, resolve_host, resolve_mixdrop, resolve_doodstream, get_last_quality_variants, get_synthesized_variants, extract_stream as base_extract_stream, _correct_stream_url, _extract_quality_from_streamruby_url
 
         def _variants_for(stream):
             v = [(lbl, u) for lbl, u in get_last_quality_variants() if u != stream]
@@ -697,48 +766,61 @@ class EgyDeadExtractor(BaseExtractor):
                 v = [(lbl, u) for lbl, u in get_synthesized_variants(stream) if u != stream]
             return v
 
+        # Correct the URL first
+        url = _correct_stream_url(url)
         low = (url or "").lower()
 
+        # ─── STREAMRUBY ──────────────────────────────────────────────────────
         if "stmruby" in low or "streamruby" in low:
             stream = resolve_streamruby(url)
             if stream:
+                stream = _correct_stream_url(stream)
+                quality = _extract_quality_from_streamruby_url(stream)
                 variants = _variants_for(stream)
                 return (
                     stream + "|Referer=https://stmruby.com/&Origin=https://stmruby.com",
-                    None,
+                    quality,
                     "https://stmruby.com/",
                     variants,
                 )
 
+        # ─── MIXDROP ────────────────────────────────────────────────────────
         if "mixdrop" in low or "mxcontent" in low:
             stream = resolve_mixdrop(url)
             if stream:
+                stream = _correct_stream_url(stream)
                 variants = _variants_for(stream)
                 return stream, None, None, variants
 
+        # ─── DOODSTREAM ─────────────────────────────────────────────────────
         if "dood" in low or "doodstream" in low or "cloudatacdn" in low:
             stream = resolve_doodstream(url)
             if stream:
+                stream = _correct_stream_url(stream)
                 variants = _variants_for(stream)
                 return stream, None, None, variants
 
+        # ─── GOVID ──────────────────────────────────────────────────────────
         if "govid.live" in low:
             try:
                 from .base import resolve_govid
                 stream = resolve_govid(url)
                 if stream:
+                    stream = _correct_stream_url(stream)
                     variants = _variants_for(stream)
                     return stream, None, None, variants
             except ImportError:
                 pass
 
-        if ".txt" in low and ("systemorchestration" in low or "highqualityprints" in low or "dramiyos" in low):
+        # ─── .TXT MANIFESTS (Maplecrest, etc.) ─────────────────────────────
+        if ".txt" in low and ("systemorchestration" in low or "highqualityprints" in low or "dramiyos" in low or "maplecrest" in low or "lakesideproductionstudio" in low):
             log("EgyDead: .txt HLS manifest detected: {}".format(url[:80]))
             html, _ = fetch(url, referer=self._get_base())
             if html and "#EXTM3U" in html:
                 variants = self._detect_quality_variants(url)
                 if variants:
                     for label, variant_url in variants:
+                        variant_url = _correct_stream_url(variant_url)
                         if "f3" in variant_url or "1080" in variant_url:
                             return variant_url, "1080p", self._get_base(), variants
                         elif "f2" in variant_url or "720" in variant_url:
@@ -746,17 +828,21 @@ class EgyDeadExtractor(BaseExtractor):
                     return variants[0][1], variants[0][0], self._get_base(), variants[1:] if len(variants) > 1 else []
                 return url, "HD", self._get_base(), []
 
+        # ─── .M3U8 DIRECT ──────────────────────────────────────────────────
         if ".m3u8" in low:
             variants = self._detect_quality_variants(url)
             if variants:
                 quality = "HD"
                 for label, variant_url in variants:
+                    variant_url = _correct_stream_url(variant_url)
                     if "f3" in variant_url or "1080" in variant_url or "_o" in variant_url or "_x" in variant_url:
                         quality = "1080p"
                     elif "f2" in variant_url or "720" in variant_url or "_h" in variant_url:
                         quality = "720p"
                     elif "f1" in variant_url or "480" in variant_url or "_n" in variant_url:
                         quality = "480p"
+                    elif "_l" in variant_url or "360" in variant_url:
+                        quality = "360p"
                 return url, quality, self._get_base(), variants
 
             quality = "HD"
@@ -766,8 +852,11 @@ class EgyDeadExtractor(BaseExtractor):
                 quality = "720p"
             elif "480" in low:
                 quality = "480p"
+            elif "360" in low:
+                quality = "360p"
             return url, quality, self._get_base(), []
 
+        # ─── .MP4 DIRECT ────────────────────────────────────────────────────
         if ".mp4" in low:
             quality = "HD"
             if "1080" in low:
@@ -778,6 +867,7 @@ class EgyDeadExtractor(BaseExtractor):
                 quality = "480p"
             return url, quality, self._get_base(), []
 
+        # ─── VIBUXER ────────────────────────────────────────────────────────
         if "vibuxer" in low:
             log("EgyDead: vibuxer embed detected: {}".format(url[:80]))
             html, _ = fetch(url, referer=self._get_base())
@@ -785,20 +875,72 @@ class EgyDeadExtractor(BaseExtractor):
                 iframe = re.search(r'<iframe[^>]+src=["\']([^"\']+)["\']', html, re.I)
                 if iframe:
                     return self.extract_stream(iframe.group(1))
-                stream = re.search(r'(https?://[^\s"\'<>]+\.(?:m3u8|txt)[^\s"\'<>]*)', html, re.I)
+                stream = re.search(r'(https?://[^\s"\'<>]+\.(?:m3u8|txt|woff2)[^\s"\'<>]*)', html, re.I)
                 if stream:
-                    return self.extract_stream(stream.group(1))
+                    return self.extract_stream(_correct_stream_url(stream.group(1)))
             return None, "", self._get_base(), []
 
+        # ─── FALLBACK ──────────────────────────────────────────────────────
         return base_extract_stream(url)
     
     def _detect_quality_variants(self, stream_url):
         if not stream_url:
             return []
         
+        # Correct the URL first
+        stream_url = _correct_stream_url(stream_url)
+        
         variants = []
         seen = set()
         
+        # ─── STREAMRUBY QUALITY PATTERN: _,l,n,h,o,.urlset/ ──────────────
+        # Example: psbm7b7diwj7_,l,n,h,o,.urlset/master.m3u8
+        quality_pattern = re.search(r'([^/]+)_(?:,l|,n|,h|,o|,l,n,h,o|,l,n,h|,l,n,o|,l,h,o|,n,h,o|,l,n|,l,h|,l,o|,n,h|,n,o|,h,o|,l,n,h,o|,l,n,h|,l,n,o|,l,h,o|,n,h,o)\.urlset/', stream_url)
+        if quality_pattern:
+            base_part = stream_url[:quality_pattern.start(1)]
+            rest = stream_url[quality_pattern.end():]
+            
+            # Define quality mappings for streamruby
+            quality_map = {
+                '_l': '360p',
+                '_n': '480p', 
+                '_h': '720p',
+                '_o': 'Original',
+                '_x': 'Original'
+            }
+            
+            # Try to find all quality variants
+            for suffix, label in quality_map.items():
+                # Construct variant URL
+                variant_url = base_part + suffix + rest
+                
+                # For streamruby, the variant might be in the folder name
+                # Alternative: the variant is in the filename pattern
+                if '/_l/' in variant_url or '/_n/' in variant_url or '/_h/' in variant_url or '/_o/' in variant_url:
+                    # Already has variant in path
+                    pass
+                else:
+                    # Try to insert variant before .urlset
+                    variant_url = re.sub(r'(_[lnho])\.urlset', r'\1.urlset', variant_url)
+                    variant_url = variant_url.replace('_.urlset', '_' + suffix + '.urlset')
+                
+                if variant_url not in seen:
+                    seen.add(variant_url)
+                    variants.append((label, variant_url))
+            
+            # Also check if the base URL itself has a quality indicator
+            if '_o' in stream_url:
+                variants.insert(0, ('Original', stream_url))
+            elif '_h' in stream_url:
+                variants.insert(0, ('720p', stream_url))
+            elif '_n' in stream_url:
+                variants.insert(0, ('480p', stream_url))
+            elif '_l' in stream_url:
+                variants.insert(0, ('360p', stream_url))
+            
+            return variants
+        
+        # ─── F1/F2/F3 PATTERN ──────────────────────────────────────────────
         f_match = re.search(r'(index-?f?)(\d+)([-_v][^\s"\'<>]+\.(?:m3u8|txt))', stream_url, re.I)
         if f_match:
             prefix = f_match.group(1)
@@ -806,12 +948,13 @@ class EgyDeadExtractor(BaseExtractor):
             base_part = stream_url[:f_match.start(1)] + prefix
             
             for quality, label in [('f1', '480p'), ('f2', '720p'), ('f3', '1080p'), ('f4', 'Original')]:
-                variant_url = base_part + quality + suffix
+                variant_url = _correct_stream_url(base_part + quality + suffix)
                 if variant_url not in seen:
                     seen.add(variant_url)
                     variants.append((label, variant_url))
             return variants
         
+        # ─── _LNHO PATTERN ──────────────────────────────────────────────────
         l_match = re.search(r'(_[lnho])(?=/)', stream_url)
         if l_match:
             suffix_map = {'_l': '360p', '_n': '480p', '_h': '720p', '_o': 'Original', '_x': 'Original'}
@@ -819,12 +962,13 @@ class EgyDeadExtractor(BaseExtractor):
             rest = stream_url[l_match.end():]
             
             for s, label in suffix_map.items():
-                variant_url = base_part + s + rest
+                variant_url = _correct_stream_url(base_part + s + rest)
                 if variant_url not in seen:
                     seen.add(variant_url)
                     variants.append((label, variant_url))
             return variants
         
+        # ─── HLS PATTERN ────────────────────────────────────────────────────
         q_match = re.search(r'/hls[23]/', stream_url)
         if q_match:
             variants.append(('HD', stream_url))

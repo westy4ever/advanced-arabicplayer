@@ -20,7 +20,7 @@ class FaselhdRipExtractor(BaseExtractor):
     
     BASE_URL = "https://faselhd.rip"
     GOVID_BASE = "https://govid.live"
-    MAX_AJAX_SERVERS = 5
+    MAX_AJAX_SERVERS = 16  # Increased from 5 to show all available servers
     NOISE_DOMAINS = {
         "unpkg.com", "cdn.jsdelivr.net", "cdnjs.cloudflare.com",
         "ajax.googleapis.com", "code.jquery.com", "stackpath.bootstrapcdn.com",
@@ -338,6 +338,8 @@ class FaselhdRipExtractor(BaseExtractor):
                          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
             log("faselhd_rip: checking AJAX for additional servers")
             for server_num in range(0, 16):
+                # Check if we've reached the maximum number of servers
+                # MAX_AJAX_SERVERS is now 16, so this will loop through all 16
                 if len(servers) > self.MAX_AJAX_SERVERS:
                     log("faselhd_rip: AJAX cap reached, stopping")
                     break

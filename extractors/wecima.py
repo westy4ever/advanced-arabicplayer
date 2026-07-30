@@ -455,14 +455,27 @@ class WecimaExtractor(BaseExtractor):
     
     def _detail_title(self, html):
         data = self._parse_json_ld(html)
-        if data:
-            if isinstance(data, dict):
-                if data.get("name"):
-                    return self._clean_title(data["name"])
-                if "@graph" in data:
-                    for item in data["@graph"]:
-                        if item.get("name") and ("فيلم" in item.get("name", "") or "مسلسل" in item.get("name", "")):
-                            return self._clean_title(item["name"])
+        if data and isinstance(data, dict):
+            graph = data.get("@graph") or ([data] if data.get("@type") else [])
+            # Prefer the actual content entry over generic WebSite/
+            # Organization entries. NOTE: a plain substring check for
+            # "فيلم"/"مسلسل" isn't reliable here - the site's own generic
+            # branding text contains "ومسلسلات" (series, plural), which
+            # literally contains "مسلسل" (series, singular) as a substring,
+            # and WebSite/Organization always come before the real
+            # WebPage/Movie entries in @graph - so a substring-only check
+            # matches the wrong (generic) entry every time.
+            preferred_types = ("Movie", "TVSeries", "TVSeason", "TVEpisode", "VideoObject")
+            skip_types = ("WebSite", "Organization", "BreadcrumbList", "ImageObject")
+            for item in graph:
+                if item.get("@type") in preferred_types and item.get("name"):
+                    return self._clean_title(item["name"])
+            for item in graph:
+                if item.get("@type") in skip_types:
+                    continue
+                name = item.get("name") or ""
+                if name and ("فيلم" in name or "مسلسل" in name):
+                    return self._clean_title(name)
         
         patterns = [
             r'<h1[^>]+itemprop="name"[^>]*>(.*?)</h1>',
@@ -480,18 +493,27 @@ class WecimaExtractor(BaseExtractor):
     
     def _detail_plot(self, html):
         data = self._parse_json_ld(html)
-        if data:
-            if isinstance(data, dict):
-                if data.get("description"):
-                    desc = self._clean_html(data["description"])
+        if data and isinstance(data, dict):
+            graph = data.get("@graph") or ([data] if data.get("@type") else [])
+            # Same issue as _detail_title: looping @graph with no type check
+            # can return a generic WebSite/Organization blurb instead of the
+            # real plot. (The WebSite entry's description here happens to be
+            # exactly 30 chars - one character under the old ">30" threshold
+            # - so this was already one edit away from breaking.)
+            preferred_types = ("Movie", "TVSeries", "TVSeason", "TVEpisode", "VideoObject")
+            skip_types = ("WebSite", "Organization", "BreadcrumbList", "ImageObject")
+            for item in graph:
+                if item.get("@type") in preferred_types and item.get("description"):
+                    desc = self._clean_html(item["description"])
+                    if desc:
+                        return desc
+            for item in graph:
+                if item.get("@type") in skip_types:
+                    continue
+                if item.get("description"):
+                    desc = self._clean_html(item["description"])
                     if desc and len(desc) > 30:
                         return desc
-                if "@graph" in data:
-                    for item in data["@graph"]:
-                        if item.get("description"):
-                            desc = self._clean_html(item["description"])
-                            if desc and len(desc) > 30:
-                                return desc
         
         patterns = [
             r'<meta[^>]+itemprop="description"[^>]+content="([^"]+)"',
@@ -509,20 +531,18 @@ class WecimaExtractor(BaseExtractor):
     
     def _detail_poster(self, html):
         data = self._parse_json_ld(html)
-        if data:
-            if isinstance(data, dict):
-                if data.get("image") and isinstance(data["image"], dict):
-                    poster = data["image"].get("url", "")
+        if data and isinstance(data, dict):
+            graph = data.get("@graph") or ([data] if data.get("@type") else [])
+            skip_types = ("WebSite", "Organization", "BreadcrumbList", "ImageObject")
+            for item in graph:
+                if item.get("@type") in skip_types:
+                    continue
+                if item.get("image") and isinstance(item["image"], dict):
+                    poster = item["image"].get("url", "")
                     if poster:
                         return self._normalize_url(poster)
-                if "@graph" in data:
-                    for item in data["@graph"]:
-                        if item.get("image") and isinstance(item["image"], dict):
-                            poster = item["image"].get("url", "")
-                            if poster:
-                                return self._normalize_url(poster)
-                        if item.get("thumbnailUrl"):
-                            return self._normalize_url(item["thumbnailUrl"])
+                if item.get("thumbnailUrl"):
+                    return self._normalize_url(item["thumbnailUrl"])
         
         patterns = [
             r'property="og:image"[^>]+content="([^"]+)"',
@@ -540,18 +560,16 @@ class WecimaExtractor(BaseExtractor):
     
     def _detail_year(self, title, html):
         data = self._parse_json_ld(html)
-        if data:
-            if isinstance(data, dict):
-                if data.get("datePublished"):
-                    year_match = re.search(r'(\d{4})', data["datePublished"])
+        if data and isinstance(data, dict):
+            graph = data.get("@graph") or ([data] if data.get("@type") else [])
+            skip_types = ("WebSite", "Organization", "BreadcrumbList", "ImageObject")
+            for item in graph:
+                if item.get("@type") in skip_types:
+                    continue
+                if item.get("datePublished"):
+                    year_match = re.search(r'(\d{4})', item["datePublished"])
                     if year_match:
                         return year_match.group(1)
-                if "@graph" in data:
-                    for item in data["@graph"]:
-                        if item.get("datePublished"):
-                            year_match = re.search(r'(\d{4})', item["datePublished"])
-                            if year_match:
-                                return year_match.group(1)
         
         m = re.search(r'<span[^>]+class="year"[^>]*>\(?\s*(\d{4})\s*\)?</span>', html or "", re.I)
         if m:
@@ -563,18 +581,16 @@ class WecimaExtractor(BaseExtractor):
     
     def _detail_rating(self, html):
         data = self._parse_json_ld(html)
-        if data:
-            if isinstance(data, dict):
-                if "aggregateRating" in data:
-                    rating = data["aggregateRating"].get("ratingValue", "")
+        if data and isinstance(data, dict):
+            graph = data.get("@graph") or ([data] if data.get("@type") else [])
+            skip_types = ("WebSite", "Organization", "BreadcrumbList", "ImageObject")
+            for item in graph:
+                if item.get("@type") in skip_types:
+                    continue
+                if "aggregateRating" in item:
+                    rating = (item["aggregateRating"] or {}).get("ratingValue", "")
                     if rating:
                         return str(rating)
-                if "@graph" in data:
-                    for item in data["@graph"]:
-                        if "aggregateRating" in item:
-                            rating = item["aggregateRating"].get("ratingValue", "")
-                            if rating:
-                                return str(rating)
         
         m = re.search(r'"ratingValue"\s*:\s*"?(\\?\d+(?:\.\d+)?)', html or "", re.I)
         if m:

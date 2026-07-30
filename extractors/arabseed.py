@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Arabseed extractor - arabseeds.cam
+Arabseed extractor - arabseed.rocks
 Inherits from BaseExtractor.
 """
 
@@ -19,9 +19,9 @@ BLOCKED_HOSTS = ("vidara.to", "bysezejataos.com")
 
 
 class ArabseedExtractor(BaseExtractor):
-    """Extractor for Arabseed - arabseeds.cam"""
+    """Extractor for Arabseed - arabseed.rocks"""
     
-    MAIN_URL = "https://arabseeds.cam/"
+    MAIN_URL = "https://arabseed.rocks/"
     
     def __init__(self):
         super(ArabseedExtractor, self).__init__()
@@ -99,7 +99,7 @@ class ArabseedExtractor(BaseExtractor):
     
     def _collect_ajax_servers(self, watch_html, watch_url):
         try:
-            clear_cookies("arabseeds.cam")
+            clear_cookies("arabseed.rocks")
         except Exception:
             pass
     
@@ -215,11 +215,21 @@ class ArabseedExtractor(BaseExtractor):
         with ThreadPoolExecutor(max_workers=3) as ex:
             for tier_results in ex.map(fetch_quality, ("1080", "720", "480")):
                 for item in tier_results:
-                    key = (item["quality"], item["url"])
+                    # NOTE: dedupe on (quality, url) alone isn't enough here.
+                    # The site's own "direct" link (and sometimes its mirror
+                    # rows) are served as freshly-signed, one-time URLs, so
+                    # the exact same logical server can come back with a
+                    # different URL on every request and slip past a
+                    # URL-only dedupe - showing up as 2-3 near-identical
+                    # "سيرفر عرب سيد" entries that all play the same file.
+                    # Also dedupe on (quality, name) to collapse those.
+                    url_key  = (item["quality"], item["url"])
+                    name_key = (item["quality"], item["name"])
                     with lock:
-                        if key in seen:
+                        if url_key in seen or name_key in seen:
                             continue
-                        seen.add(key)
+                        seen.add(url_key)
+                        seen.add(name_key)
                     results.append(item)
     
         if not results:
