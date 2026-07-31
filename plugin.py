@@ -175,7 +175,8 @@ def _get_extractor(site):
 def _normalize_query(text):
     text = (text or "").strip().lower()
     text = text.replace("أ", "ا").replace("إ", "ا").replace("آ", "ا").replace("ى", "ي")
-    return "".join(ch for ch in text if ch.isalnum())
+    text = "".join(ch if (ch.isalnum() or ch.isspace()) else " " for ch in text)
+    return re.sub(r"\s+", " ", text).strip()
 
 
 def _strip_arabic_from_english_title(title):
