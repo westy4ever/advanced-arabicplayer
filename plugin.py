@@ -13,6 +13,17 @@ Advanced Arabic Player Plugin for Enigma2
   Yellow     → بحث
   Blue       → إعدادات
   Info       → معلومات العنصر
+
+Module layout
+-------------
+This file owns the Enigma2 Screen classes and anything that is mutated
+via a bare `global` statement from inside them (the live playback
+position tracker, the local HTTP proxy hit counters). Everything else
+that has no Enigma2/UI coupling has been split out for easier isolated
+debugging:
+  plugin_util.py  - text/formatting/ranking helpers, poster-cache download
+  plugin_state.py - config/favorites/history/saved-position persistence
+  plugin_tmdb.py  - TMDb metadata client
 """
 
 import os
@@ -50,13 +61,44 @@ from Components.ServiceEventTracker import ServiceEventTracker
 from extractors import get_extractor, get_site_names, get_site_metadata
 from extractors import get_search_site_order
 
+# ─── Import from split-out helper modules ────────────────────────────────────
+from extractors.base import log as base_log, UA, fetch as base_fetch
+from extractors.base import set_browser_proxy, get_proxy_used, get_curl_failed_needs_proxy
+
+from plugin_util import (
+    SAFE_UA,
+    _site_label, _site_tagline, _site_search_item,
+    _normalize_query, _strip_arabic_from_english_title, _clean_title_for_tmdb,
+    _wrap_ui_text, _single_line_text, _search_scope_label,
+    _dedupe_items, _rank_search_items, _quality_rank, _sort_servers,
+    _decorate_item_title,
+    _display_plot_text, _pick_plot_text_with_source, _pick_plot_text,
+    _poster_cache_path, _normalize_poster_url,
+    _get_cached_poster, _fetch_poster_bytes,
+)
+from plugin_state import (
+    _PLUGIN_OWNER, _DEFAULT_TMDB_API_KEY,
+    _state_path, _default_state, _load_state, _save_state,
+    _get_config, _set_config, _entry_from_item, _upsert_library_item,
+    _toggle_favorite_entry, _is_favorite, _history_items, _favorite_items,
+    _get_saved_position, _save_position, _library_search_suggestions,
+)
+from plugin_tmdb import (
+    _tmdb_enabled, _tmdb_search_metadata, _merge_tmdb_data,
+    _tmdb_search_suggestions,
+)
+from plugin_gridlist import (
+    HomeMenuGrid, PosterCardGrid, resolve_icon_path,
+    build_pixmap_widgets_xml, build_poster_pixmap_widgets_xml,
+    HOME_GRID_COLS, HOME_GRID_ROWS, HOME_CELL_W, HOME_CELL_H,
+    HOME_CELL_MARGIN, HOME_BORDER_W, HOME_ICON_PAD_TOP, HOME_ICON_W, HOME_ICON_H,
+    POSTER_GRID_COLS, POSTER_GRID_ROWS, POSTER_W, POSTER_H,
+)
+import plugin_imagecache
+
 _PLUGIN_VERSION = "3.0.0"
 _PLUGIN_NAME    = "Advanced Arabic Player"
-_PLUGIN_OWNER   = "ArabicPlayer Team"
-_DEFAULT_TMDB_API_KEY = "01fd9e035ea1458748e99eb7216b0259"
 _TYPE_LABELS    = {"movie": "فيلم", "series": "مسلسل", "episode": "حلقة"}
-_TMDB_API_BASE  = "https://api.themoviedb.org/3"
-_TMDB_IMG_BASE  = "https://image.tmdb.org/t/p/w500"
 
 # ─── Get search order from registry ──────────────────────────────────────────
 _SEARCH_SITE_ORDER = get_search_site_order()
@@ -79,92 +121,8 @@ _CLR = {
     "text_dim":     "#484F58",
 }
 
-# ─── Poster Cache ────────────────────────────────────────────────────────────
-import hashlib
-_POSTER_CACHE_DIR = "/tmp/ap_cache"
-
-def _poster_cache_path(url):
-    if not url: return None
-    try:
-        if not os.path.isdir(_POSTER_CACHE_DIR):
-            os.makedirs(_POSTER_CACHE_DIR)
-    except Exception: pass
-    url_hash = hashlib.md5(url.encode("utf-8", "ignore")).hexdigest()
-    return os.path.join(_POSTER_CACHE_DIR, "{}.jpg".format(url_hash))
-
-def _normalize_poster_url(url):
-    if not url:
-        return url
-    if url.startswith("//"):
-        url = "https:" + url
-    try:
-        from urllib.parse import urlparse, quote, unquote, urlunparse
-        p = list(urlparse(url))
-        p[2] = quote(unquote(p[2]))
-        p[4] = quote(unquote(p[4]))
-        return urlunparse(p)
-    except Exception:
-        return url
-
-def _is_poster_cached(url):
-    path = _poster_cache_path(url)
-    return path and os.path.exists(path)
-
-def _get_cached_poster(url):
-    path = _poster_cache_path(url)
-    if path and os.path.exists(path):
-        return path
-    return None
-
-
-def _fetch_poster_bytes(url, referer, timeout=7):
-    req = urllib2.Request(url, headers={"User-Agent": SAFE_UA, "Referer": referer})
-    data = urllib2.urlopen(req, timeout=timeout).read()
-    looks_like_webp = url.lower().split("?", 1)[0].endswith(".webp") or data[:4] == b"RIFF"
-    if not looks_like_webp:
-        return data
-    try:
-        from PIL import Image
-        import io
-        img = Image.open(io.BytesIO(data)).convert("RGB")
-        out = io.BytesIO()
-        img.save(out, format="JPEG")
-        return out.getvalue()
-    except Exception:
-        pass
-    try:
-        alt_url = re.sub(r'\.webp(\?.*)?$', lambda m: ".jpg" + (m.group(1) or ""), url, flags=re.I)
-        if alt_url != url:
-            alt_req = urllib2.Request(alt_url, headers={"User-Agent": SAFE_UA, "Referer": referer})
-            alt_data = urllib2.urlopen(alt_req, timeout=timeout).read()
-            if alt_data:
-                return alt_data
-    except Exception:
-        pass
-    return data
-
-
-# ─── Logging ─────────────────────────────────────────────────────────────────
-from extractors.base import log as base_log, UA, fetch as base_fetch
-# ── Proxy imports ──
-from extractors.base import set_browser_proxy, get_proxy_used, get_curl_failed_needs_proxy
-
-SAFE_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-_STATE_CACHE = None
-
 def my_log(msg):
     base_log(msg)
-
-
-# ─── Helper ──────────────────────────────────────────────────────────────────
-def _site_label(site):
-    meta = get_site_metadata(site)
-    return meta.get("title", str(site or "").capitalize())
-
-
-def _site_tagline(site):
-    meta = get_site_metadata(site)
-    return meta.get("tagline", "")
 
 
 def _get_extractor(site):
@@ -172,232 +130,20 @@ def _get_extractor(site):
     return get_extractor(site)
 
 
-def _normalize_query(text):
-    text = (text or "").strip().lower()
-    text = text.replace("أ", "ا").replace("إ", "ا").replace("آ", "ا").replace("ى", "ي")
-    text = "".join(ch if (ch.isalnum() or ch.isspace()) else " " for ch in text)
-    return re.sub(r"\s+", " ", text).strip()
-
-
-def _strip_arabic_from_english_title(title):
-    if not title:
-        return title
-    stripped = title.replace(" ", "")
-    if not stripped:
-        return title
-    ar_count = sum(1 for c in stripped if "\u0600" <= c <= "\u06ff")
-    if ar_count / len(stripped) >= 0.30:
-        return title
-    cleaned = re.sub(r"[\u0600-\u06ff]+", " ", title)
-    cleaned = re.sub(r"[\s|\-–_]+$", "", cleaned)
-    cleaned = re.sub(r"^[\s|\-–_]+", "", cleaned)
-    cleaned = re.sub(r"\s{2,}", " ", cleaned).strip(" -|_")
-    return cleaned if cleaned.strip() else title
-
-
-def _clean_title_for_tmdb(title):
-    if not title: return ""
-    junk = [
-        u"مترجم", u"اون لاين", u"بجودة", u"عالية", u"كامل", u"تحميل", u"مشاهدة", u"فيلم", u"مسلسل",
-        u"انمي", u"كرتون", u"حصري", u"شاشه", u"كامله", u"نسخة", u"اصلية", u"bluray", u"web-dl", u"hdtv", u"720p", u"1080p", u"4k",
-        u"توب سينما", u"عرب سيد", u"فاصل اعلاني", u"faselhd",
-    ]
-    title = title.lower()
-    for word in junk:
-        title = title.replace(word, "")
-    title = re.sub(r'\s+\d{4}\s*$', '', title)
-    return re.sub(r'\s+', ' ', title).strip()
-
-
-def _wrap_ui_text(text, width=40, max_lines=2, fallback=""):
-    text = re.sub(r"\s+", " ", text or "").strip()
-    if not text:
-        return fallback
-    words = text.split(" ")
-    lines = []
-    current = ""
-
-    for word in words:
-        candidate = word if not current else "{} {}".format(current, word)
-        if len(candidate) <= width:
-            current = candidate
-            continue
-        if current:
-            lines.append(current)
-            if len(lines) >= max_lines:
-                break
-        current = word
-
-    if len(lines) < max_lines and current:
-        lines.append(current)
-    if not lines:
-        lines = [text[:width]]
-
-    consumed = " ".join(lines)
-    if len(consumed) < len(text):
-        lines[-1] = lines[-1].rstrip(" .،") + "..."
-    return "\n".join(lines[:max_lines])
-
-
-def _single_line_text(text, width=54, fallback=""):
-    return _wrap_ui_text(text, width=width, max_lines=1, fallback=fallback)
-
-
-def _search_scope_label(scope):
-    if scope == "all":
-        return "كل المصادر: EgyDead / Akoam / Arabseed / Wecima / TopCinemaa"
-    return "المصدر الحالي: {}".format(_site_label(scope))
-
-
-def _site_search_item(site):
-    return {
-        "title": "بحث داخل {}".format(_site_label(site)),
-        "_action": "search_site",
-        "_site": site,
-        "type": "tool",
-        "plot": "ابحث داخل {} فقط بدون خلط النتائج مع باقي المصادر.".format(_site_label(site)),
-    }
-
-
-def _dedupe_items(items):
-    unique = []
-    seen = set()
-    for item in items or []:
-        key = item.get("url") or item.get("title")
-        if not key or key in seen:
-            continue
-        seen.add(key)
-        unique.append(item)
-    return unique
-
-
-def _rank_search_items(items, query):
-    q = _normalize_query(query)
-    q_words = [w for w in q.split() if len(w) >= 2] if q else []
-
-    strong   = []
-    weak     = []
-    no_match = []
-
-    for item in _dedupe_items(items):
-        title  = item.get("title", "")
-        ntitle = _normalize_query(title)
-        rank   = 9
-
-        if not q:
-            rank = 5
-        elif ntitle == q:
-            rank = 0
-        elif ntitle.startswith(q):
-            rank = 1
-        elif q in ntitle:
-            rank = 2
-        elif q_words:
-            matched_words = sum(1 for w in q_words if w in ntitle)
-            if matched_words == len(q_words):
-                rank = 3
-            elif matched_words >= max(1, len(q_words) * 2 // 3):
-                rank = 4
-            elif matched_words > 0:
-                rank = 5
-
-        entry = (rank, title.lower(), item)
-        if rank <= 3:
-            strong.append(entry)
-        elif rank <= 5:
-            weak.append(entry)
-        else:
-            no_match.append(item)
-
-    strong.sort(key=lambda r: (r[0], r[1]))
-    weak.sort(key=lambda r: (r[0], r[1]))
-
-    result = [r[2] for r in strong]
-
-    if len(result) < 3:
-        result += [r[2] for r in weak[:max(0, 5 - len(result))]]
-
-    if not result and weak:
-        result = [r[2] for r in weak]
-
-    return result
-
-
-def _quality_rank(server_name):
-    text = (server_name or "").lower()
-    if "2160" in text or "4k" in text:
-        return 0
-    if "1080" in text:
-        return 1
-    if "720" in text or "hd" in text:
-        return 2
-    if "480" in text:
-        return 3
-    if "360" in text:
-        return 4
-    return 9
-
-
-def _sort_servers(servers):
-    return sorted(servers or [], key=lambda s: (_quality_rank(s.get("name", "")), s.get("name", "").lower()))
-
-
-def _decorate_item_title(item, site=None):
-    action = item.get("_action", "")
-    
-    # Handle separators (non-clickable divider lines)
-    if action == "separator" or item.get("type") == "separator":
-        return "─── {} ───".format(item.get("title", ""))
-    
-    title = _strip_arabic_from_english_title((item.get("title") or "---").strip())
-    item_type = item.get("type", action)
-    
-    if action.startswith("site_"):
-        return title
-
-    # For filter page items (they have type="category" but contain movie data)
-    # Check if this is actually a movie from a filter page
-    if item_type == "category" and item.get("url") and "release-year" in item.get("url", ""):
-        # This is a movie from filter page, show as movie
-        return title
-
-    if item_type == "movie":
-        prefix = "[فيلم]"
-    elif item_type == "series":
-        prefix = "[مسلسل]"
-    elif item_type == "season":
-        prefix = "[موسم]"
-    elif item_type == "episode":
-        prefix = "[حلقة]"
-    elif item_type == "category":
-        # Categories - show without prefix
-        return title
-    else:
-        prefix = "•"
-
-    item_site = item.get("_site") or site
-
-    # FIX: user requested the "[فيلم]"/"[مسلسل]"/"[حلقة]" bracket prefix be
-    # removed from list display entirely - just show the clean title.
-    if item_type in ("movie", "series", "episode", "season"):
-        return title
-
-    # Only show site label for tools, not for movies/series/episodes
-    if item_site and item_type == "tool":
-        return "{} [{}] {}".format(prefix, _site_label(item_site), title)
-
-    return "{} {}".format(prefix, title)
-
-
-def _state_path():
-    for candidate in ("/etc/enigma2/advanced_arabic_player_state.json", os.path.join(PLUGIN_PATH, "advanced_arabic_player_state.json"), "/tmp/advanced_arabic_player_state.json"):
-        try:
-            parent = os.path.dirname(candidate)
-            if parent and os.path.isdir(parent) and os.access(parent, os.W_OK):
-                return candidate
-        except Exception:
-            pass
-    return "/tmp/advanced_arabic_player_state.json"
+def _drain_cmit_queue():
+    with _CMIT_LOCK:
+        items = list(_CMIT_QUEUE)
+        del _CMIT_QUEUE[:]
+    for _f, _a, _kw in items:
+        try: _f(*_a, **_kw)
+        except Exception as _e:
+            try: my_log("CMIT drain: {}".format(_e))
+            except Exception: pass
+    with _CMIT_LOCK:
+        pending = bool(_CMIT_QUEUE)
+    if pending and _CMIT_TIMER is not None:
+        try: _CMIT_TIMER.start(50, True)
+        except Exception: pass
 
 
 _CMIT_QUEUE = []
@@ -405,151 +151,36 @@ _CMIT_LOCK  = threading.Lock()
 _CMIT_TIMER = None
 
 
-def _default_state():
-    return {
-        "config": {
-            "owner": _PLUGIN_OWNER,
-            "tmdb_api_key": _DEFAULT_TMDB_API_KEY,
-            "browser_proxy": "",   # NEW: external proxy URL
-        },
-        "favorites": [],
-        "history": [],
-    }
-
-
-def _load_state():
-    global _STATE_CACHE
-    if _STATE_CACHE is not None:
-        return _STATE_CACHE
-    state = _default_state()
-    path = _state_path()
-    try:
-        if os.path.exists(path):
-            with open(path, "r") as f:
-                loaded = json.load(f)
-            if isinstance(loaded, dict):
-                state.update(loaded)
-                state["config"] = dict(_default_state()["config"], **(loaded.get("config") or {}))
-    except Exception as e:
-        my_log("State load error: {}".format(e))
-    _STATE_CACHE = state
-    return _STATE_CACHE
-
-
-def _save_state(state=None):
-    global _STATE_CACHE
-    _STATE_CACHE = state or _load_state()
-    path = _state_path()
-    tmp  = path + ".tmp"
-    try:
-        with open(tmp, "w") as f:
-            json.dump(_STATE_CACHE, f)
-            f.flush()
-            os.fsync(f.fileno())
-        os.rename(tmp, path)
-    except Exception as e:
-        my_log("State save error: {}".format(e))
-        try: os.remove(tmp)
-        except Exception: pass
-
-
-def _get_config(key, default=""):
-    value = (_load_state().get("config") or {}).get(key, default)
-    if key == "tmdb_api_key" and not value:
-        return _DEFAULT_TMDB_API_KEY
-    if key == "owner" and not value:
-        return _PLUGIN_OWNER
-    return value
-
-
-def _set_config(key, value):
-    state = _load_state()
-    state.setdefault("config", {})[key] = value
-    _save_state(state)
-
-
-def _entry_from_item(item, site, m_type, extra=None):
-    entry = {
-        "title": item.get("title", ""),
-        "url": item.get("url", ""),
-        "poster": item.get("poster") or item.get("image") or "",
-        "plot": item.get("plot", ""),
-        "year": item.get("year", ""),
-        "rating": item.get("rating", ""),
-        "type": item.get("type", "") or m_type,
-        "_action": item.get("_action", "details"),
-        "_site": item.get("_site", site),
-        "_m_type": item.get("_m_type", m_type),
-        "_saved_at": int(time.time()),
-    }
-    if extra:
-        entry.update(extra)
-    return entry
-
-
-def _upsert_library_item(bucket, entry, limit=100):
-    state = _load_state()
-    items = state.setdefault(bucket, [])
-    key   = entry.get("url")
-    if not entry.get("last_position_sec"):
-        for _old in items:
-            if _old.get("url") == key and _old.get("last_position_sec"):
-                entry["last_position_sec"] = _old["last_position_sec"]
-                break
-    items = [i for i in items if i.get("url") != key]
-    items.insert(0, entry)
-    state[bucket] = items[:limit]
-    _save_state(state)
-
-
-def _toggle_favorite_entry(entry):
-    state = _load_state()
-    favorites = state.setdefault("favorites", [])
-    key = entry.get("url")
-    for idx, item in enumerate(favorites):
-        if item.get("url") == key:
-            favorites.pop(idx)
-            _save_state(state)
-            return False
-    favorites.insert(0, entry)
-    state["favorites"] = favorites[:100]
-    _save_state(state)
-    return True
-
-
-def _is_favorite(url):
-    return any(item.get("url") == url for item in (_load_state().get("favorites") or []))
-
-
-def _history_items():
-    return _load_state().get("history") or []
-
-
-def _favorite_items():
-    return _load_state().get("favorites") or []
-
-
-def _get_saved_position(url):
-    for item in (_load_state().get("history") or []):
-        if item.get("url") == url:
-            pos = int(item.get("last_position_sec") or 0)
-            return pos if pos > 30 else 0
-    return 0
-
-
-def _save_position(url, seconds):
-    seconds = int(seconds or 0)
-    if 0 < seconds < 30:
-        my_log("_save_position: skipping {}s (< 30s threshold)".format(seconds))
-        return
-    state = _load_state()
-    for item in (state.get("history") or []):
-        if item.get("url") == url:
-            item["last_position_sec"] = seconds
-            _save_state(state)
+def callInMainThread(func, *args, **kwargs):
+    global _CMIT_TIMER
+    with _CMIT_LOCK:
+        _CMIT_QUEUE.append((func, args, kwargs))
+        if _CMIT_TIMER is None:
+            try:
+                _CMIT_TIMER = eTimer()
+                _CMIT_TIMER.callback.append(_drain_cmit_queue)
+            except Exception:
+                _CMIT_TIMER = None
+        if _CMIT_TIMER is not None:
+            try:
+                _CMIT_TIMER.start(50, True)
+            except Exception:
+                pass
             return
 
+    try:
+        from twisted.internet import reactor
+        reactor.callFromThread(_drain_cmit_queue)
+    except Exception:
+        pass
 
+
+# ─── Live playback position tracker ──────────────────────────────────────────
+# NOTE: these globals are read AND reassigned via bare `global NAME` from
+# many methods inside AdvancedArabicPlayerSimplePlayer below (pause/seek/OSD
+# update). That cross-method mutation pattern is why this block stays in
+# plugin.py rather than moving to plugin_state.py - splitting it would mean
+# rewriting every one of those call sites to go through a module attribute.
 _GLOBAL_POS_TIMER      = None
 _GLOBAL_POS_SESSION    = None
 _GLOBAL_POS_ITEM       = ""
@@ -605,388 +236,6 @@ def _stop_pos_tracker():
     except Exception:
         pass
 
-
-def _library_search_suggestions(query="", current_site="", limit=8):
-    q = _normalize_query(query)
-    rows = []
-    seen = set()
-    for source_name, items, source_rank in (
-        ("المفضلة", _favorite_items(), 0),
-        ("السجل", _history_items(), 1),
-    ):
-        for item in items or []:
-            title = re.sub(r"\s+", " ", item.get("title", "") or "").strip()
-            if not title:
-                continue
-            norm = _normalize_query(title)
-            if not norm or norm in seen:
-                continue
-            if q:
-                if norm == q:
-                    score = 0
-                elif norm.startswith(q):
-                    score = 1
-                elif q in norm:
-                    score = 2
-                else:
-                    continue
-            else:
-                score = 5
-            if current_site and item.get("_site") == current_site:
-                score -= 1
-            seen.add(norm)
-            rows.append((
-                score,
-                source_rank,
-                -int(item.get("_saved_at") or 0),
-                {
-                    "title": title,
-                    "query": title,
-                    "source": source_name,
-                    "site": item.get("_site", ""),
-                    "kind": _TYPE_LABELS.get(item.get("type", ""), ""),
-                    "year": item.get("year", ""),
-                }
-            ))
-    rows.sort(key=lambda row: (row[0], row[1], row[2]))
-    return [row[3] for row in rows[:limit]]
-
-
-def _tmdb_enabled():
-    return bool((_get_config("tmdb_api_key", "") or "").strip())
-
-
-def _tmdb_request(path, params=None):
-    api_key = (_get_config("tmdb_api_key", "") or "").strip()
-    if not api_key:
-        return None
-    base_payload = {"api_key": api_key}
-    if params:
-        base_payload.update(params)
-    for language in ("ar", "en-US"):
-        payload = dict(base_payload)
-        payload["language"] = language
-        url = "{}{}?{}".format(_TMDB_API_BASE, path, urlencode(payload))
-        try:
-            raw, _ = base_fetch(
-                url,
-                referer="https://www.themoviedb.org/",
-                extra_headers={"Accept": "application/json"}
-            )
-            if not raw:
-                continue
-            data = json.loads(raw)
-            if isinstance(data, dict):
-                if data.get("overview") or data.get("results") or language == "en-US":
-                    return data
-        except Exception as e:
-            my_log("TMDb request failed {} [{}]: {}".format(path, language, e))
-    return None
-
-
-def _tmdb_request_language(path, language="ar", params=None, accept_any=False):
-    api_key = (_get_config("tmdb_api_key", "") or "").strip()
-    if not api_key:
-        return None
-    payload = {"api_key": api_key, "language": language}
-    if params:
-        payload.update(params)
-    url = "{}{}?{}".format(_TMDB_API_BASE, path, urlencode(payload))
-    try:
-        raw, _ = base_fetch(
-            url,
-            referer="https://www.themoviedb.org/",
-            extra_headers={"Accept": "application/json"}
-        )
-        if not raw:
-            return None
-        data = json.loads(raw)
-        if not isinstance(data, dict):
-            return None
-        if accept_any or data.get("overview") or data.get("results"):
-            return data
-    except Exception as e:
-        my_log("TMDb language request failed {} [{}]: {}".format(path, language, e))
-    return None
-
-
-def _tmdb_poster_url(path):
-    if not path:
-        return ""
-    if path.startswith("http"):
-        return path
-    return _TMDB_IMG_BASE + path
-
-
-def _tmdb_pick_poster(media_kind, tmdb_id, fallback_path=""):
-    if not tmdb_id:
-        return _tmdb_poster_url(fallback_path or "")
-    images = _tmdb_request_language(
-        "/{}/{}/images".format(media_kind, tmdb_id),
-        language="en-US",
-        params={"include_image_language": "ar,en,null"},
-        accept_any=True,
-    ) or {}
-    posters = images.get("posters") or []
-    for wanted_lang in ("ar", None, "en"):
-        for poster in posters:
-            if poster.get("iso_639_1") == wanted_lang and poster.get("file_path"):
-                return _tmdb_poster_url(poster.get("file_path"))
-    return _tmdb_poster_url(fallback_path or "")
-
-
-def _tmdb_media_kind(item_type):
-    if item_type in ("series", "episode", "tv"):
-        return "tv"
-    return "movie"
-
-
-def _tmdb_pick_best(results, query, year=""):
-    query_norm = _normalize_query(query)
-    target_year = (year or "")[:4]
-    scored = []
-    for result in results or []:
-        title = result.get("title") or result.get("name") or ""
-        title_norm = _normalize_query(title)
-        score = 9
-        if title_norm == query_norm:
-            score = 0
-        elif title_norm.startswith(query_norm):
-            score = 1
-        elif query_norm and query_norm in title_norm:
-            score = 2
-        release = str(result.get("release_date") or result.get("first_air_date") or "")
-        if target_year and release[:4] == target_year:
-            score -= 1
-        scored.append((score, title.lower(), result))
-    scored.sort(key=lambda row: (row[0], row[1]))
-    return scored[0][2] if scored else None
-
-
-def _tmdb_search_metadata(title, year="", item_type="movie"):
-    if not title or not _tmdb_enabled():
-        return None
-    media_kind = _tmdb_media_kind(item_type)
-    variants = [title.strip()]
-    simple = re.sub(r"\s*\(\d{4}\)\s*$", "", title).strip()
-    if simple and simple not in variants:
-        variants.append(simple)
-    plain = re.sub(r"[:|_\-]+", " ", simple).strip()
-    if plain and plain not in variants:
-        variants.append(plain)
-    clean = re.sub(r"\b(bluray|webrip|web-dl|hdrip|hdcam|cam|1080p|720p|480p|360p)\b", "", plain, flags=re.I).strip()
-    clean = re.sub(r"\s+", " ", clean).strip(" -|")
-    if clean and clean not in variants:
-        variants.append(clean)
-    arabic_clean = re.sub(
-        r"\b(مشاهدة|فيلم|مسلسل|الحلقة|حلقة|الموسم|مترجم(?:ة)?|مدبلج(?:ة)?|اون لاين|أون لاين)\b",
-        "",
-        clean,
-        flags=re.I,
-    ).strip()
-    arabic_clean = re.sub(r"\s+", " ", arabic_clean).strip(" -|")
-    if arabic_clean and arabic_clean not in variants:
-        variants.append(arabic_clean)
-
-    best = None
-    for query in variants:
-        params = {"query": query}
-        if year:
-            if media_kind == "movie":
-                params["year"] = year[:4]
-            else:
-                params["first_air_date_year"] = year[:4]
-        data = _tmdb_request("/search/{}".format(media_kind), params) or {}
-        best = _tmdb_pick_best(data.get("results") or [], query, year)
-        if not best:
-            params.pop("year", None)
-            params.pop("first_air_date_year", None)
-            best = _tmdb_pick_best((_tmdb_request("/search/{}".format(media_kind), params) or {}).get("results") or [], query, "")
-        if best:
-            break
-    if not best:
-        return None
-    detail_ar = _tmdb_request_language(
-        "/{}/{}".format(media_kind, best.get("id")),
-        language="ar",
-        params={"append_to_response": "credits"},
-        accept_any=True,
-    ) or {}
-    detail_en = _tmdb_request_language(
-        "/{}/{}".format(media_kind, best.get("id")),
-        language="en-US",
-        params={"append_to_response": "credits"},
-        accept_any=True,
-    ) or {}
-    detail = detail_ar or detail_en
-    if not detail:
-        detail = _tmdb_request("/{}/{}".format(media_kind, best.get("id"))) or {}
-    if not detail:
-        detail = best
-    genres_source = detail_ar or detail_en or detail
-    genres = ", ".join([g.get("name", "") for g in genres_source.get("genres") or [] if g.get("name")])
-    localized_plot = (
-        (detail_ar.get("overview") or "").strip()
-        or (detail_en.get("overview") or "").strip()
-        or (best.get("overview") or "").strip()
-    )
-    localized_title = (
-        detail_ar.get("title")
-        or detail_ar.get("name")
-        or detail_en.get("title")
-        or detail_en.get("name")
-        or detail.get("title")
-        or detail.get("name")
-        or title
-    )
-    return {
-        "title": localized_title,
-        "plot": localized_plot,
-        "poster": _tmdb_pick_poster(media_kind, best.get("id"), detail_ar.get("poster_path") or detail_en.get("poster_path") or detail.get("poster_path") or ""),
-        "rating": "{:.1f}".format(float(detail.get("vote_average") or 0)) if detail.get("vote_average") else "",
-        "year": str(detail.get("release_date") or detail.get("first_air_date") or "")[:4],
-        "genres": genres,
-        "tmdb_id": detail.get("id"),
-        "tmdb_kind": media_kind,
-    }
-
-
-def _merge_tmdb_data(data):
-    if not data or not data.get("title"):
-        return data
-    data = dict(data)
-    if not data.get("plot") and data.get("desc"):
-        data["plot"] = data.get("desc")
-    item_type = data.get("type", "movie")
-    if item_type == "episode":
-        return data
-    tmdb = _tmdb_search_metadata(data.get("title"), data.get("year", ""), item_type)
-    if not tmdb:
-        return data
-    merged = dict(data)
-    if tmdb.get("title") and len((data.get("title") or "").strip()) < 2:
-        merged["title"] = tmdb["title"]
-    if tmdb.get("poster") and (not merged.get("poster")):
-        merged["poster"] = tmdb["poster"]
-    if tmdb.get("plot") and len(tmdb.get("plot", "")) > len(merged.get("plot", "")):
-        merged["plot"] = tmdb["plot"]
-    if tmdb.get("rating") and not merged.get("rating"):
-        merged["rating"] = tmdb["rating"]
-    if tmdb.get("year") and not merged.get("year"):
-        merged["year"] = tmdb["year"]
-    if tmdb.get("genres"):
-        merged["genres"] = tmdb["genres"]
-    if tmdb.get("plot") or tmdb.get("poster") or tmdb.get("rating") or tmdb.get("genres") or tmdb.get("year"):
-        merged["_tmdb"] = tmdb
-    return merged
-
-
-def _tmdb_search_suggestions(query, limit=8):
-    query = re.sub(r"\s+", " ", query or "").strip()
-    if len(query) < 2 or not _tmdb_enabled():
-        return []
-
-    suggestions = []
-    seen = set()
-    for media_kind, kind_label in (("movie", "فيلم"), ("tv", "مسلسل")):
-        try:
-            data = _tmdb_request("/search/{}".format(media_kind), {"query": query, "page": 1}) or {}
-            for result in data.get("results") or []:
-                title = (result.get("title") or result.get("name") or "").strip()
-                if not title:
-                    continue
-                norm = _normalize_query(title)
-                if not norm or norm in seen:
-                    continue
-                seen.add(norm)
-                year = str(result.get("release_date") or result.get("first_air_date") or "")[:4]
-                suggestions.append({
-                    "title": title,
-                    "query": title,
-                    "source": "TMDb",
-                    "site": "",
-                    "kind": kind_label,
-                    "year": year,
-                })
-                if len(suggestions) >= limit:
-                    return suggestions[:limit]
-        except Exception as e:
-            my_log("TMDb suggestions failed for {}: {}".format(media_kind, e))
-    return suggestions[:limit]
-
-
-def _display_plot_text(value):
-    text = re.sub(r"\s+", " ", value or "").strip()
-    return text or "القصة غير متوفرة حالياً لهذا العنصر."
-
-
-def _pick_plot_text_with_source(*sources):
-    best = ""
-    best_source = ""
-    for source in sources:
-        if isinstance(source, dict):
-            candidates = [
-                ("plot", source.get("plot")),
-                ("overview", source.get("overview")),
-                ("desc", source.get("desc")),
-                ("tmdb.plot", (source.get("_tmdb") or {}).get("plot")),
-            ]
-        else:
-            candidates = [("value", source)]
-        for label, candidate in candidates:
-            text = _display_plot_text(candidate)
-            if text == "القصة غير متوفرة حالياً لهذا العنصر.":
-                continue
-            if len(text) > len(best):
-                best = text
-                best_source = label
-    return best or "القصة غير متوفرة حالياً لهذا العنصر.", best_source or "none"
-
-
-def _pick_plot_text(*sources):
-    return _pick_plot_text_with_source(*sources)[0]
-
-
-def _drain_cmit_queue():
-    with _CMIT_LOCK:
-        items = list(_CMIT_QUEUE)
-        del _CMIT_QUEUE[:]
-    for _f, _a, _kw in items:
-        try: _f(*_a, **_kw)
-        except Exception as _e:
-            try: my_log("CMIT drain: {}".format(_e))
-            except Exception: pass
-    with _CMIT_LOCK:
-        pending = bool(_CMIT_QUEUE)
-    if pending and _CMIT_TIMER is not None:
-        try: _CMIT_TIMER.start(50, True)
-        except Exception: pass
-
-
-def callInMainThread(func, *args, **kwargs):
-    global _CMIT_TIMER
-    with _CMIT_LOCK:
-        _CMIT_QUEUE.append((func, args, kwargs))
-        if _CMIT_TIMER is None:
-            try:
-                _CMIT_TIMER = eTimer()
-                _CMIT_TIMER.callback.append(_drain_cmit_queue)
-            except Exception:
-                _CMIT_TIMER = None
-        # Start the timer INSIDE the lock
-        if _CMIT_TIMER is not None:
-            try:
-                _CMIT_TIMER.start(50, True)
-            except Exception:
-                pass
-            return  # Timer started, we're done
-    
-    # Only reach here if _CMIT_TIMER is None (fallback to reactor)
-    try:
-        from twisted.internet import reactor
-        reactor.callFromThread(_drain_cmit_queue)
-    except Exception:
-        pass
 
 # ─── Local HTTP Proxy (HiSilicon SSL Shield) ─────────────────────────────────
 _PROXY_PORT = 19888
@@ -1139,18 +388,18 @@ class AdvancedArabicPlayerHome(Screen):
     skin = """
     <screen name="AdvancedArabicPlayerHome" position="center,center" size="1920,1080"
             title="Advanced Arabic Player" flags="wfNoBorder">
-        <ePixmap position="0,0" size="1920,1080" pixmap="{}/images/bg.png" zPosition="0" alphatest="blend" />
+        <ePixmap position="0,0" size="1920,1080" pixmap="{plugin_path}/images/bg.png" zPosition="0" alphatest="blend" />
 
-        <!-- ═══ Header Bar ═══ -->
-        <widget name="title_bar"  position="0,0"     size="1920,120" backgroundColor="#0D1117" zPosition="1" />
-        <widget name="title_text" position="45,18"   size="750,57"  font="Regular;48" foregroundColor="#00E5FF" transparent="1" zPosition="3" />
-        <widget name="subtitle"   position="45,75"   size="750,36"  font="Regular;26" foregroundColor="#8B949E" transparent="1" zPosition="3" />
-        <widget name="status"     position="1050,24"  size="825,42"  font="Regular;28" foregroundColor="#FFD740" transparent="1" halign="right" zPosition="3" />
-        <widget name="footer"     position="1050,72"  size="825,36"  font="Regular;24" foregroundColor="#58A6FF" transparent="1" halign="right" zPosition="3" />
+        <!-- ═══ Header Bar (shrunk to grow the grid area) ═══ -->
+        <widget name="title_bar"  position="0,0"     size="1920,80" backgroundColor="#0D1117" zPosition="1" />
+        <widget name="title_text" position="45,6"    size="1100,36" font="Regular;28" foregroundColor="#00E5FF" transparent="1" zPosition="3" />
+        <widget name="subtitle"   position="45,42"   size="1100,28" font="Regular;20" foregroundColor="#8B949E" transparent="1" zPosition="3" />
+        <widget name="status"     position="1150,8"  size="725,30"  font="Regular;22" foregroundColor="#FFD740" transparent="1" halign="right" zPosition="3" />
+        <widget name="footer"     position="1150,40" size="725,26"  font="Regular;18" foregroundColor="#58A6FF" transparent="1" halign="right" zPosition="3" />
 
-        <!-- ═══ Menu Panel (Left) ═══ -->
-        <widget name="menu_box"   position="30,142"   size="1080,810" backgroundColor="#161B22" zPosition="1" />
-        <widget name="menu"       position="52,165"  size="1035,765" zPosition="2"
+        <!-- ═══ Menu Panel - full width now (category-link pickers only) ═══ -->
+        <widget name="menu_box"   position="20,90"   size="1880,915" backgroundColor="#161B22" zPosition="1" />
+        <widget name="menu"       position="40,105"  size="1840,885" zPosition="2"
                 scrollbarMode="showOnDemand"
                 foregroundColor="#F0F6FC"
                 foregroundColorSelected="#00E5FF"
@@ -1158,24 +407,42 @@ class AdvancedArabicPlayerHome(Screen):
                 backgroundColorSelected="#21262D"
                 font="Regular;39" itemHeight="81" transparent="1" />
 
-        <!-- ═══ Preview Panel (Right) ═══ -->
-        <widget name="preview_box" position="1140,142"  size="750,810" backgroundColor="#1C2333" zPosition="1" />
-        <widget name="poster"      position="1215,172" size="600,540" zPosition="3" alphatest="blend" />
-        <widget name="preview_title" position="1162,735" size="705,90" font="Regular;36" foregroundColor="#FFD740" transparent="1" zPosition="3" halign="center" />
-        <widget name="preview_meta"  position="1162,832" size="705,42" font="Regular;26" foregroundColor="#00E5FF" transparent="1" zPosition="3" halign="center" />
-        <widget name="preview_info" position="1162,882" size="705,54" font="Regular;22" foregroundColor="#8B949E" transparent="1" zPosition="3" halign="center" />
+        <!-- ═══ Home site-selection grid (plugin2.py layout: 4x3, border+icon+cyan effect) ═══ -->
+        <widget name="home_grid" position="20,90" size="1880,900" scrollbarMode="showNever" transparent="1" zPosition="2" />
+{home_grid_pics}
 
-        <!-- ═══ Button Bar ═══ -->
-        <widget name="btn_bar"    position="0,975"   size="1920,105" backgroundColor="#0D1117" zPosition="1" />
-        <widget name="key_red"    position="45,990"  size="420,42" font="Regular;27" foregroundColor="#FF6B6B" transparent="1" halign="center" zPosition="3" />
-        <widget name="key_green"  position="510,990" size="420,42" font="Regular;27" foregroundColor="#39D98A" transparent="1" halign="center" zPosition="3" />
-        <widget name="key_yellow" position="975,990" size="420,42" font="Regular;27" foregroundColor="#FFD740" transparent="1" halign="center" zPosition="3" />
-        <widget name="key_blue"   position="1440,990" size="420,42" font="Regular;27" foregroundColor="#58A6FF" transparent="1" halign="center" zPosition="3" />
+        <!-- ═══ Movie/series poster grid (categories/search/favorites/history) ═══ -->
+        <widget name="poster_grid" position="40,90" size="1840,754" scrollbarMode="showNever" transparent="1" zPosition="2" />
+{poster_grid_pics}
+        <widget name="grid_status_left"  position="40,860"  size="900,32" font="Regular;22" foregroundColor="#8B949E" transparent="1" halign="left" zPosition="3" />
+        <widget name="grid_status_right" position="940,860" size="900,32" font="Regular;22" foregroundColor="#8B949E" transparent="1" halign="right" zPosition="3" />
+
+        <!-- ═══ Button Bar (shrunk to grow the grid area) ═══ -->
+        <widget name="btn_bar"    position="0,1015"  size="1920,65" backgroundColor="#0D1117" zPosition="1" />
+        <widget name="key_red"    position="45,1028" size="420,32" font="Regular;22" foregroundColor="#FF6B6B" transparent="1" halign="center" zPosition="3" />
+        <widget name="key_green"  position="510,1028" size="420,32" font="Regular;22" foregroundColor="#39D98A" transparent="1" halign="center" zPosition="3" />
+        <widget name="key_yellow" position="975,1028" size="420,32" font="Regular;22" foregroundColor="#FFD740" transparent="1" halign="center" zPosition="3" />
+        <widget name="key_blue"   position="1440,1028" size="420,32" font="Regular;22" foregroundColor="#58A6FF" transparent="1" halign="center" zPosition="3" />
     </screen>
     """
 
+    _HOME_GRID_X = 20
+    _HOME_GRID_Y = 90
+    _POSTER_GRID_X = 40
+    _POSTER_GRID_Y = 90
+
     def __init__(self, session):
-        self.skin = AdvancedArabicPlayerHome.skin.format(PLUGIN_PATH)
+        self.skin = AdvancedArabicPlayerHome.skin.format(
+            plugin_path=PLUGIN_PATH,
+            home_grid_pics=build_pixmap_widgets_xml(
+                self._HOME_GRID_X, self._HOME_GRID_Y,
+                HOME_GRID_COLS, HOME_GRID_ROWS, HOME_CELL_W, HOME_CELL_H,
+                HOME_CELL_MARGIN, HOME_BORDER_W, HOME_ICON_PAD_TOP, HOME_ICON_W, HOME_ICON_H,
+            ),
+            poster_grid_pics=build_poster_pixmap_widgets_xml(
+                self._POSTER_GRID_X, self._POSTER_GRID_Y,
+            ),
+        )
         Screen.__init__(self, session)
         self.session = session
         self._items  = []
@@ -1185,9 +452,8 @@ class AdvancedArabicPlayerHome(Screen):
         self._m_type = "movie"
         self._last_query = ""
         self._nav_stack = []
-        self._debounce_timer = eTimer()
-        self._debounce_timer.callback.append(self._debounced_load_poster)
-        self._pending_poster_url = None
+        self._content_title_base = ""
+        self._content_subtitle = ""
 
         self["title_bar"]  = Label("")
         self["title_text"] = Label("Advanced Arabic Player  v{}".format(_PLUGIN_VERSION))
@@ -1195,23 +461,33 @@ class AdvancedArabicPlayerHome(Screen):
         self["status"]     = Label("جاري التحميل...")
         self["footer"]     = Label("TMDb  |  المفضلة  |  السجل")
         self["menu_box"]   = Label("")
-        self["preview_box"] = Label("")
-        self["poster"]     = Pixmap()
         self["menu"]       = MenuList([])
-        self["preview_title"] = Label("")
-        self["preview_meta"] = Label("")
-        self["preview_info"] = Label("")
         self["btn_bar"]    = Label("")
-        self["key_red"]    = Label("أحدث أفلام")
-        self["key_green"]  = Label("أحدث مسلسلات")
+        self["key_red"]    = Label("خروج")
+        self["key_green"]  = Label("المفضلة")
         self["key_yellow"] = Label("بحث")
-        self["key_blue"]   = Label("الصفحة التالية")
+        self["key_blue"]   = Label("الإعدادات")
 
-        self.picLoad = ePicLoad()
-        self.picLoad.PictureData.get().append(self._paintPoster)
-        self._tmp_posters = []
-        self._requested_poster_url = None
-        self._poster_lock = threading.Lock()
+        # ── Home site-menu grid (plugin2.py layout, 4x3) ──
+        self["home_grid"] = HomeMenuGrid()
+        self["home_grid"].onSelectionChanged = self._onGridSelectionChanged
+        for _r in range(HOME_GRID_ROWS):
+            for _c in range(HOME_GRID_COLS):
+                self["pic_%d_%d" % (_r, _c)] = Pixmap()
+
+        # ── Movie/series poster grid (categories/search/favorites/history) ──
+        self["poster_grid"] = PosterCardGrid()
+        self["poster_grid"].onSelectionChanged = self._onPosterGridSelectionChanged
+        for _r in range(POSTER_GRID_ROWS):
+            for _c in range(POSTER_GRID_COLS):
+                self["poster_%d_%d" % (_r, _c)] = Pixmap()
+        self["grid_status_left"] = Label("")
+        self["grid_status_right"] = Label("")
+        self._posterPollTimer = eTimer()
+        self._posterPollTimer.callback.append(self._onPosterPollTick)
+
+        self._display_mode = "home"  # "home" | "poster" | "list"
+
         self.onClose.append(self._onPluginClose)
 
         self["actions"] = ActionMap(
@@ -1219,25 +495,27 @@ class AdvancedArabicPlayerHome(Screen):
             {
                 "ok":     self._onOk,
                 "cancel": self._onBack,
-                "red":    self._loadMovies,
-                "green":  self._loadSeries,
+                "red":    self._onRed,
+                "green":  self._onGreen,
                 "yellow": self._onSearch,
-                "blue":   self._nextPage,
-                "up":     lambda: self["menu"].up(),
-                "down":   lambda: self["menu"].down(),
-                "left":   lambda: self["menu"].pageUp(),
-                "right":  lambda: self["menu"].pageDown(),
+                "blue":   self._onBlue,
+                "up":     self._navUp,
+                "down":   self._navDown,
+                "left":   self._navLeft,
+                "right":  self._navRight,
             },
             -1
         )
 
-        try:
-            self["menu"].onSelectionChanged.append(self._refreshPreview)
-        except Exception:
-            pass
         self.onLayoutFinish.append(self._init)
 
     def _init(self):
+        for _r in range(HOME_GRID_ROWS):
+            for _c in range(HOME_GRID_COLS):
+                try:
+                    self["pic_%d_%d" % (_r, _c)].instance.setScale(1)
+                except Exception:
+                    pass
         self._showHome()
 
     def _setHeader(self, title, subtitle="", status=None):
@@ -1248,6 +526,7 @@ class AdvancedArabicPlayerHome(Screen):
 
     def _showHome(self):
         self._source = "home"
+        self._display_mode = "home"
         self._page   = 1
         self._nav_stack = []
         self._setHeader(
@@ -1255,38 +534,130 @@ class AdvancedArabicPlayerHome(Screen):
             "المشغل العربي المتقدم",
             "الرئيسية"
         )
-        items = [
-            ("━━  المصادر  ━━━━━━━━━━━━━━━━━", "separator"),
-            ("EgyDead          واجهة حديثة وبوسترات", "site_egydead"),
-            ("EgyDead Coupons  النسخة العربية - تصنيفات مترجمة", "site_egydead_coupons"),
-            ("Akwam (Classic)  موقع اكوام الكلاسيكي", "site_akwam"),
-            ("Akwams (Modern)  موقع اكوام الحديث", "site_akwams"),
-            ("Arabseed         تصنيفات مرتبة", "site_arabseed"),
-            ("Wecima           أقسام واسعة وبحث سريع", "site_wecima"),
-            ("Shaheed4u        أفلام ومسلسلات حصرية", "site_shaheed"),
-            ("Shahid4u         شاهد فور يو - أفلام ومسلسلات مترجمة", "site_shahid4u"),
-            ("TopCinemaa       مكتبة ضخمة", "site_topcinema"),
-            ("FaselHD (RIP)    واجهة حديثة - سيرفرات متعددة", "site_fasel"),
-            ("FaselHD (HDX)    النسخة الكلاسيكية - دقة عالية", "site_faselhdx"),
-            ("Arablionz        عرب ليونز - افلام ومسلسلات سيرفر Lionz Tv", "site_arablionz"),
-            ("━━  الأدوات  ━━━━━━━━━━━━━━━━━", "separator"),
-            ("البحث الشامل", "search"),
-            ("المفضلة", "favorites"),
-            ("السجل", "history"),
-            ("الإعدادات", "settings"),
+        # NOTE: this is the site-selection grid only (plugin2.py's own
+        # MainMenuGrid held just the 12 sites too - favorites/search/
+        # settings are reachable via the button bar instead, matching
+        # plugin2's red=exit/green=favorites/yellow=search/blue=settings
+        # mapping applied below).
+        site_items = [
+            ("EgyDead", "واجهة حديثة وبوسترات", "site_egydead"),
+            ("EgyDead Coupons", "النسخة العربية - تصنيفات مترجمة", "site_egydead_coupons"),
+            ("Akwam (Classic)", "موقع اكوام الكلاسيكي", "site_akwam"),
+            ("Akwams (Modern)", "موقع اكوام الحديث", "site_akwams"),
+            ("Arabseed", "تصنيفات مرتبة", "site_arabseed"),
+            ("Wecima", "أقسام واسعة وبحث سريع", "site_wecima"),
+            ("Shaheed4u", "أفلام ومسلسلات حصرية", "site_shaheed"),
+            ("Shahid4u", "شاهد فور يو - أفلام ومسلسلات مترجمة", "site_shahid4u"),
+            ("TopCinemaa", "مكتبة ضخمة", "site_topcinema"),
+            ("FaselHD (RIP)", "واجهة حديثة - سيرفرات متعددة", "site_fasel"),
+            ("FaselHD (HDX)", "النسخة الكلاسيكية - دقة عالية", "site_faselhdx"),
+            ("Arablionz", "عرب ليونز - افلام ومسلسلات سيرفر Lionz Tv", "site_arablionz"),
         ]
-        self._items = [{"title": t, "_action": a} for t, a in items]
-        self["menu"].setList([t for t, _ in items])
+        self._items = [{"title": t, "tagline": tag, "_action": a} for t, tag, a in site_items]
+
+        self._showHomeMode()
+        self["home_grid"].setList(self._items)
+
+        self["key_red"].setText("خروج")
+        self["key_green"].setText("المفضلة")
+        self["key_yellow"].setText("بحث")
+        self["key_blue"].setText("الإعدادات")
+
         self["footer"].setText("TMDb  |  {} مفضلة  |  {} سجل".format(len(_favorite_items()), len(_history_items())))
-        self._refreshPreview()
+        self._onGridSelectionChanged()
+
+    # ── Visibility toggles between the three Home render modes ──────────────
+
+    def _hidePosterPixmaps(self):
+        for _r in range(POSTER_GRID_ROWS):
+            for _c in range(POSTER_GRID_COLS):
+                self["poster_%d_%d" % (_r, _c)].hide()
+
+    def _showHomeMode(self):
+        self._posterPollTimer.stop()
+        self["menu"].hide()
+        self["poster_grid"].hide()
+        self._hidePosterPixmaps()
+        self["grid_status_left"].hide()
+        self["grid_status_right"].hide()
+        self["home_grid"].show()
+
+    def _showPosterMode(self):
+        self["home_grid"].hide()
+        for _r in range(HOME_GRID_ROWS):
+            for _c in range(HOME_GRID_COLS):
+                self["pic_%d_%d" % (_r, _c)].hide()
+        self["menu"].hide()
+        self["poster_grid"].show()
+        self["grid_status_left"].show()
+        self["grid_status_right"].show()
+        self._posterPollTimer.start(600, False)
+
+    def _showListMode(self):
+        self._posterPollTimer.stop()
+        self["home_grid"].hide()
+        for _r in range(HOME_GRID_ROWS):
+            for _c in range(HOME_GRID_COLS):
+                self["pic_%d_%d" % (_r, _c)].hide()
+        self["poster_grid"].hide()
+        self._hidePosterPixmaps()
+        self["grid_status_left"].hide()
+        self["grid_status_right"].hide()
+        self["menu"].show()
+
+    # ── Home site grid: icon overlay + selection status ─────────────────────
+
+    def _updateIcons(self):
+        for _r in range(HOME_GRID_ROWS):
+            for _c in range(HOME_GRID_COLS):
+                self["pic_%d_%d" % (_r, _c)].hide()
+        for row, col, item in self["home_grid"].getPageItems():
+            icon_path = resolve_icon_path(item, PLUGIN_PATH)
+            if not icon_path:
+                continue
+            widget = self["pic_%d_%d" % (row, col)]
+            try:
+                widget.instance.setPixmapFromFile(icon_path)
+                widget.show()
+            except Exception as e:
+                my_log("_updateIcons setPixmapFromFile failed: {}".format(e))
+
+    def _onGridSelectionChanged(self):
+        item = self["home_grid"].getCurrent()
+        if item:
+            page, total_pages = self["home_grid"].getPageInfo()
+            tagline = item.get("tagline", "")
+            if total_pages > 1:
+                self["status"].setText("{}  |  صفحة {}/{}".format(tagline, page, total_pages) if tagline else "صفحة {}/{}".format(page, total_pages))
+            else:
+                self["status"].setText(tagline or "الرئيسية")
+        self._updateIcons()
 
     def _onOk(self):
+        if self._display_mode == "home":
+            item = self["home_grid"].getCurrent()
+            if not item:
+                return
+            a = item.get("_action", "")
+            if a.startswith("site_"):
+                self._site = a.replace("site_", "")
+                self._showSiteCategories()
+            return
+
+        if self._display_mode == "poster":
+            item = self["poster_grid"].getCurrent()
+            if not item:
+                return
+            self._openItem(item)
+            return
+
+        # ── everything below is the original menu/category/search/
+        #    favorites/history logic, unchanged ──
         idx = self["menu"].getSelectedIndex()
         if idx < 0 or idx >= len(self._items):
             return
         item = self._items[idx]
 
-        # Ignore separator items (they are not clickable)
         if item.get("_action") == "separator" or item.get("type") == "separator":
             return
 
@@ -1313,44 +684,114 @@ class AdvancedArabicPlayerHome(Screen):
                 return
 
         curr_type = item.get("type", item.get("_action"))
-        
-        # ── Handle category items (load category page) ──
+
         if curr_type == "category":
             if item.get("_m_type") in ("movie", "series"):
                 self._m_type = item.get("_m_type")
             self._loadCategory(item["url"], item["title"])
             return
 
-        # ── Handle season, series, episode as detail pages ──
-        # A season item should open a season detail page (which shows episodes)
-        # A series item should open a series detail page (which shows seasons)
-        # An episode item should open an episode detail page (which shows servers)
         if curr_type in ("season", "series", "episode", "movie", "details"):
             self._openItem(item)
             return
 
+    # ── Mode-aware navigation (grid on Home/poster screens, list elsewhere) ─
+
+    def _navUp(self):
+        if self._display_mode == "home":
+            self["home_grid"].moveUp()
+        elif self._display_mode == "poster":
+            self["poster_grid"].moveUp()
+        else:
+            self["menu"].up()
+
+    def _navDown(self):
+        if self._display_mode == "home":
+            self["home_grid"].moveDown()
+        elif self._display_mode == "poster":
+            self["poster_grid"].moveDown()
+        else:
+            self["menu"].down()
+
+    def _navLeft(self):
+        if self._display_mode == "home":
+            self["home_grid"].moveLeft()
+        elif self._display_mode == "poster":
+            self["poster_grid"].moveLeft()
+        else:
+            self["menu"].pageUp()
+
+    def _navRight(self):
+        if self._display_mode == "home":
+            self["home_grid"].moveRight()
+        elif self._display_mode == "poster":
+            self["poster_grid"].moveRight()
+        else:
+            self["menu"].pageDown()
+
+    # ── Mode-aware colored buttons: plugin2 mapping on Home only, original
+    #    meanings preserved everywhere else ──────────────────────────────
+
+    def _onRed(self):
+        if self._source == "home":
+            self.close()
+        else:
+            self._loadMovies()
+
+    def _onGreen(self):
+        if self._source == "home":
+            self._showLibrary("favorites")
+        else:
+            self._loadSeries()
+
+    def _onBlue(self):
+        if self._source == "home":
+            self._openSettings()
+        else:
+            self._nextPage()
+
     def _onPluginClose(self):
         try:
-            self.picLoad.PictureData.get().remove(self._paintPoster)
+            self._posterPollTimer.stop()
         except Exception:
             pass
-        self._clearTmpPosters()
+        try:
+            plugin_imagecache.cancelAsyncImages()
+        except Exception:
+            pass
 
     def _onBack(self):
         if self._nav_stack:
             state = self._nav_stack.pop()
             self._source = state.get("source", "home")
+
+            # Restoring to "home" always goes through _showHome() (which
+            # cheaply rebuilds the same 12-site list) rather than replaying
+            # stored items through _setList - home items carry no "type"
+            # field for _setList's poster/list content-detection to key
+            # off, so a generic replay would land in plain list mode
+            # instead of the site grid.
+            if self._source == "home":
+                self._showHome()
+                return
+
             self._site = state.get("site", self._site)
             self._m_type = state.get("m_type", self._m_type)
             self._page = state.get("page", 1)
             self._cat_url = state.get("cat_url", getattr(self, "_cat_url", None))
             self._cat_name = state.get("cat_name", getattr(self, "_cat_name", ""))
             self._next_page_url = state.get("next_page_url", None)
+            self._content_title_base = state.get("content_title_base", "")
+            self._content_subtitle = state.get("content_subtitle", "")
             items = state.get("items", [])
             header = state.get("header", {})
             if items:
                 self._setList(items)
-                self._setHeader(**header)
+                # Poster mode already set its own header (category/site +
+                # live page number) via _updatePosterHeader - only replay
+                # the plain snapshot for list-mode (category-link) screens.
+                if self._display_mode != "poster":
+                    self._setHeader(**header)
             else:
                 self._showHome()
         elif self._source != "home":
@@ -1367,6 +808,8 @@ class AdvancedArabicPlayerHome(Screen):
             "cat_url": getattr(self, "_cat_url", None),
             "cat_name": getattr(self, "_cat_name", ""),
             "next_page_url": getattr(self, "_next_page_url", None),
+            "content_title_base": getattr(self, "_content_title_base", ""),
+            "content_subtitle": getattr(self, "_content_subtitle", ""),
             "items": list(self._items),
             "header": {
                 "title": self["title_text"].getText(),
@@ -1375,159 +818,115 @@ class AdvancedArabicPlayerHome(Screen):
             },
         })
 
-    def _clearTmpPosters(self):
-        for p in self._tmp_posters:
-            try:
-                if os.path.exists(p):
-                    os.remove(p)
-            except Exception:
-                pass
-        self._tmp_posters = []
-
-    def _paintPoster(self, picData=None):
-        ptr = self.picLoad.getData()
-        if ptr:
-            self["poster"].instance.setPixmap(ptr)
-            self["poster"].show()
-        else:
-            my_log("_paintPoster (preview): native decode returned empty picture data")
+    def _setListButtons(self):
+        # Non-home screens keep the original button meanings (unaffected
+        # by the plugin2-style relabeling that only applies to Home).
+        self["key_red"].setText("أحدث أفلام")
+        self["key_green"].setText("أحدث مسلسلات")
+        self["key_yellow"].setText("بحث")
+        self["key_blue"].setText("الصفحة التالية")
 
     def _setList(self, items):
+        self._setListButtons()
+
+        # Only real movie/series/episode entries go to the poster grid -
+        # pseudo "next page" links (type="category", appended by the
+        # extractors' own network-level pagination) are dropped here so
+        # they never render as a broken card or open a Detail screen on
+        # OK; the blue button (_nextPage) already fetches the next page
+        # via self._next_page_url independent of what's in this list.
+        content_items = [i for i in items if i.get("type") in ("movie", "series", "episode")]
+
+        if content_items:
+            self._items = content_items
+            self._display_mode = "poster"
+            self._showPosterMode()
+            self["poster_grid"].setList(content_items)
+            self._onPosterGridSelectionChanged()
+            return
+
         self._items = items
+        self._display_mode = "list"
+        self._showListMode()
+        self["footer"].setText("")
         self["menu"].setList([_decorate_item_title(i, self._site) for i in items])
         self["status"].setText("{} عنصر".format(len(items)))
-        self._refreshPreview()
-        try:
-            self._first_item_timer.stop()
-        except Exception:
-            pass
-        self._first_item_timer = eTimer()
-        self._first_item_timer.callback.append(self._refreshPreview)
-        self._first_item_timer.start(700, True)
 
-    def _refreshPreview(self):
-        if not self._items:
-            self["preview_title"].setText("")
-            self["preview_meta"].setText("")
-            self["preview_info"].setText("")
-            self["poster"].hide()
-            return
+    # ── Poster grid: live artwork-cache counter + async downloads ───────────
+    # Poster art is painted by separate overlay Pixmap widgets (poster_r_c),
+    # not embedded in the grid's MultiContent rows - see plugin_gridlist.py.
+    # Downloads go through plugin_imagecache's bounded worker-pool queue
+    # (ported from westy4ever/XtreamNew) instead of one thread per image.
 
-        idx = self["menu"].getSelectedIndex()
-        if idx < 0 or idx >= len(self._items):
-            idx = 0
-        item = self._items[idx]
-        action = item.get("_action", "")
-        item_type = item.get("type", action)
-        title = _strip_arabic_from_english_title(item.get("title", ""))
-        site = item.get("_site", self._site)
+    def _updateGridFooter(self):
+        page, total_pages = self["poster_grid"].getPageInfo()
+        total = len(self._items)
+        start = (page - 1) * (POSTER_GRID_COLS * POSTER_GRID_ROWS) + 1
+        end = min(start + POSTER_GRID_COLS * POSTER_GRID_ROWS - 1, total)
+        cached = sum(1 for i in self._items if plugin_imagecache.getCachedImage(i.get("poster") or "", target_size=(POSTER_W, POSTER_H)))
+        self["grid_status_left"].setText("Shows {}-{} / {} | Page {} / {}".format(start, end, total, page, total_pages))
+        self["grid_status_right"].setText("Artwork cache: {} / {}".format(cached, total))
 
-        if action == "separator":
-            self["preview_title"].setText("")
-            self["preview_meta"].setText("")
-            self["preview_info"].setText("")
-            self["poster"].hide()
-            return
-
-        meta = []
-        info_parts = []
-        if action.startswith("site_"):
-            site_key = action.replace("site_", "")
-            meta.append("المصدر")
-            info_parts.append(_site_tagline(site_key))
-        elif action in ("search", "search_site", "favorites", "history", "settings"):
-            meta.append("أداة")
+    def _updatePosterHeader(self):
+        """Category name + live grid page number in the title, source
+        site name only (no 'المصدر:' label) in the subtitle, and no
+        TMDb/favorites/history counts while browsing the poster grid."""
+        page, total_pages = self["poster_grid"].getPageInfo()
+        base = self._content_title_base or ""
+        if total_pages > 1:
+            title = "{} \u2014 {}/{}".format(base, page, total_pages) if base else "{}/{}".format(page, total_pages)
         else:
-            if site:
-                meta.append(_site_label(site))
-            if item.get("year"):
-                meta.append(item.get("year"))
-            if item.get("rating"):
-                meta.append("{}/10".format(item.get("rating")))
-            if item_type in _TYPE_LABELS:
-                meta.append(_TYPE_LABELS.get(item_type))
+            title = base
+        self._setHeader(title, self._content_subtitle or "")
+        self["footer"].setText("")
 
-        self["preview_title"].setText(_wrap_ui_text(title, width=28, max_lines=3, fallback="بدون عنوان"))
-        self["preview_meta"].setText(_wrap_ui_text("  |  ".join(meta), width=36, max_lines=2))
-        self["preview_info"].setText(_wrap_ui_text("  ".join(info_parts), width=36, max_lines=2) if info_parts else "")
+    def _onPosterGridSelectionChanged(self):
+        self._updateGridFooter()
+        self._updatePosterHeader()
+        self._updatePosterPixmaps()
+        self._requestVisiblePosters()
 
-        poster_url = item.get("poster") or item.get("image") or ""
-        poster_url = _normalize_poster_url(poster_url)
-
-        with self._poster_lock:
-            self._requested_poster_url = poster_url
-
-        if poster_url:
-            cached = _get_cached_poster(poster_url)
-            if cached:
-                self._display_poster_from_file(cached)
+    def _requestVisiblePosters(self):
+        """Queue downloads for whatever's on the current page. The
+        selected item jumps the queue via requestImageAsyncPriority so
+        navigation doesn't sit behind a full page of unrelated artwork."""
+        selected = self["poster_grid"].getCurrent()
+        for row, col, item in self["poster_grid"].getPageItems():
+            url = item.get("poster") or ""
+            if not url:
+                continue
+            if item is selected:
+                plugin_imagecache.requestImageAsyncPriority(url, target_size=(POSTER_W, POSTER_H))
             else:
-                self._pending_poster_url = poster_url
-                try:
-                    self._debounce_timer.stop()
-                except Exception:
-                    pass
-                self._debounce_timer.start(300, True)
-        else:
-            self["poster"].hide()
+                plugin_imagecache.requestImageAsync(url, target_size=(POSTER_W, POSTER_H))
 
-    def _debounced_load_poster(self):
-        url = self._pending_poster_url
-        if url:
-            threading.Thread(target=self._downloadPoster, args=(url,), daemon=True).start()
+    def _updatePosterPixmaps(self):
+        visible = {}
+        for row, col, item in self["poster_grid"].getPageItems():
+            visible[(row, col)] = item
 
-    def _display_poster_from_file(self, path):
-        try:
-            self.picLoad.setPara((self["poster"].instance.size().width(), self["poster"].instance.size().height(), 1, 1, 0, 1, "#000000"))
-            self.picLoad.startDecode(path)
-        except Exception as e:
-            my_log("_display_poster error: {}".format(e))
+        for r in range(POSTER_GRID_ROWS):
+            for c in range(POSTER_GRID_COLS):
+                widget = self["poster_%d_%d" % (r, c)]
+                item = visible.get((r, c))
+                url = item.get("poster") if item else ""
+                path = plugin_imagecache.getCachedImage(url, target_size=(POSTER_W, POSTER_H)) if url else ""
+                if path:
+                    try:
+                        widget.instance.setPixmapFromFile(path)
+                        widget.show()
+                    except Exception as e:
+                        my_log("_updatePosterPixmaps setPixmapFromFile failed: {}".format(e))
+                        widget.hide()
+                else:
+                    widget.hide()
 
-    def _downloadPoster(self, url):
-        if not url: return
-        with self._poster_lock:
-            if url != self._requested_poster_url:
-                my_log("_downloadPoster (preview): superseded, skipping {}".format(url))
-                return
-
-        try:
-            url = _normalize_poster_url(url)
-
-            cached = _get_cached_poster(url)
-            if cached:
-                my_log("_downloadPoster (preview): using cached file for {}".format(url))
-                with self._poster_lock:
-                    if url != self._requested_poster_url: return
-                callInMainThread(self._display_poster_from_file, cached)
-                return
-
-            cache_path = _poster_cache_path(url)
-            from urllib.parse import urlparse as _urlparse
-            _p = _urlparse(url)
-            referer = "{}://{}/".format(_p.scheme, _p.netloc)
-            my_log("_downloadPoster (preview): fetching {}".format(url))
-            data = _fetch_poster_bytes(url, referer, timeout=7)
-            my_log("_downloadPoster (preview): downloaded {} bytes for {}".format(len(data) if data else 0, url))
-
-            if cache_path:
-                with open(cache_path, "wb") as f:
-                    f.write(data)
-            else:
-                cache_path = "/tmp/ap_preview_{}.jpg".format(int(time.time()))
-                with open(cache_path, "wb") as f:
-                    f.write(data)
-                self._tmp_posters.append(cache_path)
-
-            with self._poster_lock:
-                if url != self._requested_poster_url:
-                    my_log("_downloadPoster (preview): superseded after download, cached for next time {}".format(url))
-                    return
-                callInMainThread(self._display_poster_from_file, cache_path)
-        except Exception as e:
-            my_log("_downloadPoster preview error: {}".format(e))
-            with self._poster_lock:
-                if url == self._requested_poster_url:
-                    callInMainThread(self["poster"].hide)
+    def _onPosterPollTick(self):
+        if self._display_mode != "poster":
+            self._posterPollTimer.stop()
+            return
+        self._updatePosterPixmaps()
+        self._updateGridFooter()
 
     def _nextPage(self):
         cat_url  = getattr(self, "_cat_url",  None)
@@ -1546,7 +945,6 @@ class AdvancedArabicPlayerHome(Screen):
             if not get_categories:
                 cats = [{"title": "لا توجد أقسام", "type": "error"}]
             else:
-                # For egydead, get both movie and series categories
                 if self._site == "egydead" or self._site == "egydead_coupons":
                     movie_cats = get_categories("movie")
                     series_cats = get_categories("series")
@@ -1606,7 +1004,6 @@ class AdvancedArabicPlayerHome(Screen):
             if not get_category_items:
                 callInMainThread(self["status"].setText, "لا توجد نتائج")
                 return
-            # Some extractors take page parameter, others don't
             if self._site in ["egydead", "egydead_coupons", "fasel", "faselhdx"]:
                 items = get_category_items(url, page=self._page)
             else:
@@ -1627,10 +1024,9 @@ class AdvancedArabicPlayerHome(Screen):
             None
         )
         self._next_page_url = next_page_item["url"] if next_page_item else None
-        self._setHeader(
-            "{} — صفحة {}".format(self._cat_name, self._page),
-            "المصدر: {}".format(_site_label(self._site))
-        )
+        self._content_title_base = self._cat_name
+        self._content_subtitle = _site_label(self._site)
+        self._setHeader(self._content_title_base, self._content_subtitle)
         self._setList(_dedupe_items(items))
 
     def _loadMovies(self):
@@ -1658,6 +1054,8 @@ class AdvancedArabicPlayerHome(Screen):
             self["menu"].setList(["القائمة فارغة"])
             self._items = []
             return
+        self._content_title_base = title
+        self._content_subtitle = subtitle
         self._setHeader(title, subtitle)
         self._setList(items)
 
@@ -1728,36 +1126,25 @@ class AdvancedArabicPlayerHome(Screen):
             self["status"].setText("لا توجد نتائج مطابقة لـ: {}".format(query))
             self["menu"].setList(["لا توجد نتائج مطابقة"])
             return
-        subtitle = "بحث في {} — {} نتيجة".format(_search_scope_label(scope), len(items))
-        self._setHeader(
-            "نتائج: {}".format(query),
-            subtitle
-        )
+        self._content_title_base = "نتائج: {}".format(query)
+        self._content_subtitle = _search_scope_label(scope)
+        self._setHeader(self._content_title_base, self._content_subtitle)
         self._setList(items)
 
     def _openItem(self, item):
-        # ── Determine the correct m_type for the item ──
-        # If the item already has a type, use it. Otherwise fallback.
         item_type = item.get("type", self._m_type)
-        
-        # ── For series items, force m_type="series" so the detail screen
-        #     knows to look for seasons (seasons-list) ──
+
         if item_type == "series":
             m_type = "series"
-        # ── For season items, force m_type="season" so the detail screen
-        #     knows to look for episodes (EpsList) ──
         elif item_type == "season":
             m_type = "season"
-        # ── For episode items, force m_type="episode" so the detail screen
-        #     knows to look for servers (serversList) ──
         elif item_type == "episode":
             m_type = "episode"
-        # ── For movie items, force m_type="movie" ──
         elif item_type == "movie":
             m_type = "movie"
         else:
             m_type = item_type or self._m_type
-        
+
         self.session.open(
             AdvancedArabicPlayerDetail,
             item=item,
@@ -2158,7 +1545,7 @@ class AdvancedArabicPlayerDetail(Screen):
         self._poster_loaded = False
         self._raw_title = ""
         self._closed = False
-        self._proxy_warning_shown = False  # <-- FIX: Add this line
+        self._proxy_warning_shown = False
 
         self._extract_lock = threading.Lock()
         self._extract_token = 0
@@ -2213,7 +1600,6 @@ class AdvancedArabicPlayerDetail(Screen):
         if idx < 0:
             return
 
-        # Check quality-picker sub-menu first
         if self._quality_choices:
             if idx >= len(self._quality_choices):
                 return
@@ -2256,7 +1642,7 @@ class AdvancedArabicPlayerDetail(Screen):
             server = self._servers[idx]
             self["status"].setText("Extracting stream...")
             self["status"].show()
-            threading.Thread(target=self._bgExtract, args=(server, token), daemon=True).start()        
+            threading.Thread(target=self._bgExtract, args=(server, token), daemon=True).start()
 
     def _load(self):
         item_snapshot = self._item
@@ -2281,7 +1667,6 @@ class AdvancedArabicPlayerDetail(Screen):
                 if not getattr(self, "_closed", False):
                     callInMainThread(self["status"].setText, u"لا توجد بيانات")
                 return
-            # Some extractors take m_type parameter, others don't
             if site in ["egydead", "egydead_coupons", "akwam", "akwams", "wecima"]:
                 data = get_page(url, m_type=m_type)
             else:
@@ -2338,7 +1723,6 @@ class AdvancedArabicPlayerDetail(Screen):
                 pass
         self.close()
 
-
     def _paintPoster(self, picData=None):
         ptr = self.picLoad.getData()
         if ptr:
@@ -2349,10 +1733,6 @@ class AdvancedArabicPlayerDetail(Screen):
             my_log("_paintPoster (detail): native decode returned empty picture data")
 
     def _onLoaded(self, data):
-        # FIX: narrow residual race - callInMainThread schedules this
-        # asynchronously, so self._closed could flip True between the
-        # background thread's check and this actually running. Final
-        # safety net before touching self._item/UI widgets below.
         if getattr(self, "_closed", False):
             return
         if not data:
@@ -2360,9 +1740,6 @@ class AdvancedArabicPlayerDetail(Screen):
             return
 
         self._data = data
-        # FIX: clear any leftover quality-picker state from a previous
-        # server's extraction - a fresh page load should always start
-        # from the top-level server/episode list, not a stale sub-menu.
         self._quality_choices = []
         current_title = _strip_arabic_from_english_title(
             data.get("title") or self._item.get("title", ""))
@@ -2833,16 +2210,16 @@ def _build_remote_play_candidates(url):
         # 1st: Native HLS (4097) - FASTEST for HLS
         add_candidate(4097, plain_url, "4097 مباشر HLS")
         add_candidate(4097, url, "4097 + headers HLS")
-        
+
         # 2nd: Native Movie Player (8193) - FAST
         add_candidate(8193, plain_url, "8193 مباشر")
         add_candidate(5001, plain_url, "5001 مباشر")
-        
+
         # 3rd: exteplayer3 (5002) - SLOWER but more compatible
         if has_exteplayer:
             add_candidate(5002, plain_url, "5002 exteplayer3")
             add_candidate(5002, url, "5002 exteplayer3 + headers")
-        
+
         # LAST: Proxy fallbacks
         if proxied:
             add_candidate(4097, proxied, "4097 + proxy HLS", True)
@@ -2857,12 +2234,12 @@ def _build_remote_play_candidates(url):
         add_candidate(4097, plain_url, "4097 مباشر")
         add_candidate(8193, plain_url, "8193 مباشر")
         add_candidate(4097, url, "4097 + headers")
-        
+
         # 2nd: exteplayer3 (5002) - SLOWER but more compatible
         if has_exteplayer:
             add_candidate(5002, plain_url, "5002 exteplayer3")
             add_candidate(5002, url, "5002 exteplayer3 + headers")
-        
+
         # LAST: Proxy fallbacks
         if proxied:
             add_candidate(5001, proxied, "5001 + proxy", True)
