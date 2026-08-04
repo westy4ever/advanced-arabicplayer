@@ -2,19 +2,6 @@
 """
 Wecima extractor - wecima.click
 Inherits from BaseExtractor.
-
-FIXES APPLIED:
-1. CRITICAL: _home_html method/attribute name conflict - instance attribute
-   `self._home_html = None` shadowed the method `_home_html()`, making it
-   uncallable (TypeError: 'NoneType' is not callable). This broke
-   _category_from_home() → get_categories() entirely.
-2. _decode_wecima_url: first approach did `.replace('+', '')` which strips
-   valid base64 '+' characters, corrupting the encoded URL.
-3. _normalize_url: `unicode_escape` codec corrupted non-ASCII (Arabic) URLs.
-4. _extract_servers: regex used `btn` (not a real HTML tag) instead of `button`.
-5. _grid_blocks: `class="GridItem"` only matched exact class names, missing
-   elements like `class="GridItem Thumb--GridItem"`.
-6. _extract_next_page: didn't handle `&raquo;` HTML entity for pagination.
 """
 
 import re
@@ -45,20 +32,21 @@ class WecimaExtractor(BaseExtractor):
     VALID_HOST_MARKERS = ("wecima.click", "wecima.cx", "wecima.bid", "wecima.site")
     BLOCKED_HOST_MARKERS = ("alliance4creativity.com",)
 
+    # FIX: Hardcode the exact Arabic URL-encoded paths to prevent categories from mixing
     CATEGORY_FALLBACKS = {
-        "افلام اجنبي":    "/category/foreign-movies",
-        "افلام عربي":     "/category/arabic-movies",
-        "مسلسلات اجنبي":  "/category/foreign-series",
-        "مسلسلات عربية":  "/category/arabic-series",
-        "مسلسلات انمي":   "/category/anime-series",
-        "تريندج":         "/trends",
+        "افلام اجنبي":    "/category/%d8%a7%d9%81%d9%84%d8%a7%d9%85-%d8%a7%d8%ac%d9%86%d8%a8%d9%8a/",
+        "افلام عربي":     "/category/%d8%a7%d9%81%d9%84%d8%a7%d9%85-%d8%b9%d8%b1%d8%a8%d9%8a/",
+        "مسلسلات اجنبي":  "/category/%d9%85%d8%b3%d9%84%d8%b3%d9%84%d8%a7%d8%aa-%d8%a7%d8%ac%d9%86%d8%a8%d9%8a/",
+        "مسلسلات عربية":  "/category/%d9%85%d8%b3%d9%84%d8%b3%d9%84%d8%a7%d8%aa-%d8%b9%d8%b1%d8%a8%d9%8a/",
+        "مسلسلات انمي":   "/category/%d9%85%d8%b3%d9%84%d8%b3%d9%84%d8%a7%d8%aa-%d8%a7%d9%86%d9%85%d9%8a/",
+        "تريندج":         "/trends/",
     }
 
     def __init__(self):
         super(WecimaExtractor, self).__init__()
         self.main_url = self.DOMAINS[0]
         self._resolved_base = None
-        self._home_html_cache = None  # FIX: renamed from _home_html to avoid method shadow
+        self._home_html_cache = None
 
     def _host(self, url):
         try:
@@ -119,7 +107,7 @@ class WecimaExtractor(BaseExtractor):
             if html and self._looks_like_wecima_page(html):
                 self._resolved_base = self._site_root(final_url)
                 self.main_url = self._resolved_base
-                self._home_html_cache = html  # FIX: use renamed attribute
+                self._home_html_cache = html
                 log("Wecima: selected base {}".format(self._resolved_base))
                 return self._resolved_base
         self._resolved_base = self.DOMAINS[0]
@@ -134,7 +122,6 @@ class WecimaExtractor(BaseExtractor):
         if not url:
             return ""
         url = url.strip()
-        # FIX: removed unicode_escape decoding which corrupts Arabic characters
         url = url.replace("\\u0026", "&").replace("&amp;", "&").replace("\\/", "/")
         url = html_unescape(url)
         if url.startswith("//"):
@@ -214,8 +201,6 @@ class WecimaExtractor(BaseExtractor):
         return re.sub(r"\s+", " ", title).strip(" -|")
 
     def _home_html(self):
-        """Fetch and cache the home page HTML for category link extraction."""
-        # FIX: use _home_html_cache instead of _home_html (which is this method)
         if self._home_html_cache:
             return self._home_html_cache
         base = self._get_base()
@@ -232,11 +217,7 @@ class WecimaExtractor(BaseExtractor):
         return "movie"
 
     def _grid_blocks(self, html):
-        """Extract GridItem blocks from HTML.
-        FIX: use flexible class matching to catch 'GridItem Thumb--GridItem' etc.
-        """
         blocks = []
-        # FIX: match any class containing 'GridItem', not just exact class="GridItem"
         for block in re.split(r'(?=<div[^>]+class="[^"]*GridItem)', html or "", flags=re.I):
             if 'GridItem' not in block:
                 continue
@@ -247,13 +228,13 @@ class WecimaExtractor(BaseExtractor):
             if end_match:
                 blocks.append(block[: end_match.end()])
             else:
-                blocks.append(block[:3000])
+                blocks.append(block[:2500])
         return blocks
 
     def _extract_cards(self, html):
         cards = []
         seen = set()
-
+        
         for block in self._grid_blocks(html):
             href_match = re.search(r'<a[^>]+href="([^"]+)"', block, re.I)
             if not href_match:
@@ -261,38 +242,37 @@ class WecimaExtractor(BaseExtractor):
             url = self._normalize_url(href_match.group(1))
             if not url or url in seen:
                 continue
-
+            
             lowered = url.lower()
             if any(t in lowered for t in ("/category/", "/tag/", "/page/", "/filtering", "/feed/", "/trends")):
                 continue
-
+            
             title_match = (
                 re.search(r'<h2[^>]+class="hasyear"[^>]*itemprop="name"[^>]*>(.*?)</h2>', block, re.S | re.I) or
                 re.search(r'<h2[^>]+class="hasyear"[^>]*>(.*?)</h2>', block, re.S | re.I) or
-                re.search(r'title="([^"]+)"', block, re.I)
+                re.search(r'title="([^"]+)"', block, re.I) or
+                re.search(r'<h2[^>]*>(.*?)</h2>', block, re.S | re.I)
             )
             title = self._clean_title(title_match.group(1) if title_match else "")
             if not title:
                 continue
-
+            
             year = ""
             year_match = re.search(r'<span[^>]+class="year"[^>]*>\(?\s*(\d{4})\s*\)?</span>', block, re.I)
             if year_match:
                 year = year_match.group(1)
-
+            
             poster = ""
-            poster_match = re.search(r'data-src="([^"]+)"', block, re.I)
-            if poster_match:
-                poster = poster_match.group(1)
-            if not poster:
-                poster_match = re.search(r'data-lazy-style="[^"]*url\(([^)]+)\)"', block, re.I)
-                if poster_match:
-                    poster = poster_match.group(1).strip("'\" ")
-            if not poster:
+            poster_match = re.search(r'(?:data-src|src)="([^"]*(?:wp-content/uploads|/upload/)[^"]+)"', block, re.I)
+            if not poster_match:
+                poster_match = re.search(r'(?:data-src|src)="([^"]+\.(?:jpg|jpeg|png|webp))"', block, re.I)
+            if not poster_match:
                 poster_match = re.search(r'style="[^"]*--image:url\(([^)]+)\)', block, re.I)
                 if poster_match:
                     poster = poster_match.group(1).strip("'\" ")
-
+            else:
+                poster = poster_match.group(1)
+            
             seen.add(url)
             cards.append({
                 "title": title,
@@ -302,57 +282,48 @@ class WecimaExtractor(BaseExtractor):
                 "type": self._guess_type(title, url),
                 "_action": "details",
             })
-
+        
         log("Wecima: extracted {} cards".format(len(cards)))
         return cards
 
-    def _extract_next_page(self, html):
-        """Extract next page URL from pagination.
-        FIX: handle &raquo; HTML entity in addition to » character.
-        """
+    def _extract_next_page(self, html, current_url):
         patterns = [
             r'<a[^>]+class="[^"]*next[^"]*page-numbers[^"]*"[^>]+href="([^"]+)"',
             r'<a[^>]+rel="next"[^>]+href="([^"]+)"',
             r'<a[^>]+href="([^"]+)"[^>]+rel="next"',
             r'<a[^>]+class="[^"]*\bnext\b[^"]*"[^>]+href="([^"]+)"',
-            # FIX: handle both &raquo; entity and » character
             r'<a[^>]+href="([^"]+)"[^>]*>\s*(?:&raquo;|»)\s*</a>',
+            r'<a[^>]+href="([^"]+)"[^>]*>\s*<i[^>]+class="[^"]*fa-angle-right[^"]*"[^>]*></i>\s*</a>',
+            r'<a[^>]+href="([^"]+)"[^>]*>\s*<i[^>]+class="[^"]*fa-arrow-right[^"]*"[^>]*></i>\s*</a>',
         ]
         for pat in patterns:
             m = re.search(pat, html or "", re.I | re.S)
             if m:
                 return self._normalize_url(m.group(1))
+        
+        m = re.search(r'/page/(\d+)/?', current_url or "")
+        current_page = int(m.group(1)) if m else 1
+        next_page = current_page + 1
+        m = re.search(r'<a[^>]+href="([^"]+/page/{}/?)"'.format(next_page), html or "", re.I)
+        if m:
+            return self._normalize_url(m.group(1))
+            
         return ""
 
-    def _category_from_home(self, label, fallback):
-        html = self._home_html()
-        for pattern in (
-            r'<a[^>]+href="([^"]+)"[^>]*>\s*' + re.escape(label) + r'\s*</a>',
-            r'<a[^>]+href="([^"]+)"[^>]*>\s*<span[^>]*>\s*' + re.escape(label) + r'\s*</span>',
-        ):
-            m = re.search(pattern, html or "", re.S | re.I)
-            if m:
-                url = self._normalize_url(m.group(1))
-                if url:
-                    return url
-        return self._normalize_url(urljoin(self._get_base(), fallback))
-
     def _decode_wecima_url(self, encoded):
-        """Decode a base64-encoded server URL from wecima's data-url attribute.
-        FIX: removed incorrect .replace('+', '') which stripped valid base64 chars.
-        """
         if not encoded:
             return None
-
+        
+        if encoded.startswith('http://') or encoded.startswith('https://'):
+            return encoded
+            
         log("Wecima: decoding: {}".format(repr(encoded[:80])))
 
-        # Approach 1: prepend 'aHR0c' (base64 for 'http') prefix
-        # Wecima strips this prefix from encoded URLs
+        cleaned = encoded.strip().replace('+', '').replace(' ', '')
+        
         try:
-            # FIX: don't strip '+' characters - they're valid base64
-            cleaned = encoded.strip().replace(' ', '+')
-            cleaned = re.sub(r'[^A-Za-z0-9+/=]', '', cleaned)
             fixed = 'aHR0c' + cleaned
+            fixed = re.sub(r'[^A-Za-z0-9+/=]', '', fixed)
             missing_padding = len(fixed) % 4
             if missing_padding:
                 fixed += '=' * (4 - missing_padding)
@@ -365,15 +336,13 @@ class WecimaExtractor(BaseExtractor):
         except Exception as e:
             log("Wecima: prefix-scheme decode failed: {}".format(str(e)[:50]))
 
-        # Approach 2: plain base64 decode
         try:
-            cleaned = encoded.strip().replace(' ', '+')
             cleaned = re.sub(r'[^A-Za-z0-9+/=]', '', cleaned)
             missing_padding = len(cleaned) % 4
             if missing_padding:
                 cleaned += '=' * (4 - missing_padding)
             decoded_bytes = base64.b64decode(cleaned)
-
+            
             for encoding in ('ascii', 'utf-8', 'latin-1'):
                 try:
                     decoded_url = decoded_bytes.decode(encoding)
@@ -382,24 +351,23 @@ class WecimaExtractor(BaseExtractor):
                     continue
             else:
                 decoded_url = decoded_bytes.decode('ascii', errors='replace')
-
+                
             decoded_url = decoded_url.replace('\\u0026', '&').replace('\\/', '/')
             decoded_url = quote(decoded_url, safe=':/?&=#+')
-
+            
             if decoded_url.startswith('//'):
                 decoded_url = 'https:' + decoded_url
             elif decoded_url.startswith('https') and not decoded_url.startswith('https://'):
                 decoded_url = 'https://' + decoded_url[5:]
             elif decoded_url.startswith('http') and not decoded_url.startswith('http://'):
                 decoded_url = 'http://' + decoded_url[4:]
-
+                
             if decoded_url and ('http://' in decoded_url or 'https://' in decoded_url):
                 log("Wecima: decode success (plain b64 fallback): {}".format(decoded_url[:80]))
                 return decoded_url
         except Exception as e:
             log("Wecima: plain-b64 decode failed: {}".format(str(e)[:50]))
 
-        # Approach 3: URL pattern extraction (last resort)
         url_pattern = r'[a-zA-Z0-9\-]+\.(?:com|net|org|tv|cx|bid|site|click|show|video|rent|date|live|rip|top|xyz|ps)(?:/[a-zA-Z0-9\-_/]+)?'
         match = re.search(url_pattern, encoded)
         if match:
@@ -411,69 +379,58 @@ class WecimaExtractor(BaseExtractor):
         return None
 
     def _extract_servers(self, html):
-        """Extract watch server URLs from the detail page HTML."""
         servers = []
         seen = set()
-
         if not html:
             log("Wecima: empty HTML in _extract_servers")
             return []
 
-        server_block_match = re.search(r'class="WatchServersList"[^>]*>(.*?)</ul>', html, re.S | re.I)
-
+        server_block_match = re.search(r'class="[^"]*WatchServersList[^"]*"[^>]*>(.*?)</ul>', html, re.S | re.I)
         if server_block_match:
             content = server_block_match.group(1)
-            # FIX: changed 'btn' to 'button' and added more closing tags + case-insensitive
-            items = re.findall(
-                r'data-url="([^"]+)"[^>]*>(.*?)</(?:button|li|div|a|span)>',
-                content, re.S | re.I
-            )
-
+            items = re.findall(r'(?:data-url|href)="([^"]+)"[^>]*>(.*?)</(?:button|li|div|a|span)>', content, re.S | re.I)
             for encoded_url, inner_html in items:
                 decoded_url = self._decode_wecima_url(encoded_url)
                 if not decoded_url or not decoded_url.startswith('http'):
                     continue
-
                 if decoded_url not in seen:
                     name_match = re.search(r'<strong>(.*?)</strong>', inner_html, re.S | re.I)
+                    if not name_match:
+                        name_match = re.search(r'>(.*?)<', inner_html, re.S)
                     server_name = name_match.group(1).strip() if name_match else "Wecima Server"
-
+                    server_name = re.sub(r'<[^>]+>', '', server_name).strip()
                     seen.add(decoded_url)
-                    servers.append({"name": server_name, "url": decoded_url, "type": "direct"})
+                    servers.append({
+                        "name": server_name,
+                        "url": decoded_url,
+                        "type": "direct"
+                    })
                     log("Wecima: Found server '{}' -> {}".format(server_name, decoded_url[:60]))
 
         if not servers:
             log("Wecima: Targeted block not found, running deep scan fallback...")
-            # FIX: also try data-link attribute as alternative to data-url
-            fallback_items = re.findall(r'data-(?:url|link)="([a-zA-Z0-9+/=]{20,})"', html, re.I)
+            fallback_items = re.findall(r'(?:data-url|data-link|href)="([^"]+)"', html, re.I)
+            skip_domains = (
+                'facebook.com', 'twitter.com', 'instagram.com', 'youtube.com',
+                'google.com', 'wecima.', '/watch/', '/movie/', '/series/'
+            )
             for encoded_url in fallback_items:
                 decoded_url = self._decode_wecima_url(encoded_url)
                 if decoded_url and decoded_url.startswith('http') and decoded_url not in seen:
+                    if any(x in decoded_url.lower() for x in skip_domains):
+                        continue
                     seen.add(decoded_url)
-                    servers.append({"name": "Server Fallback", "url": decoded_url, "type": "direct"})
-
-        # FIX: also try raw href URLs in server list area (non-encoded)
-        if not servers:
-            raw_links = re.findall(
-                r'<(?:a|button|li)[^>]+(?:href|data-url)="(https?://[^"]+)"[^>]*>(.*?)</',
-                html, re.S | re.I
-            )
-            for raw_url, inner_html in raw_links:
-                # Skip non-streaming URLs
-                if any(x in raw_url.lower() for x in ('facebook.com', 'twitter.com', 'instagram.com', 'youtube.com', 'google.com', 'wecima.')):
-                    continue
-                if raw_url not in seen:
-                    name_match = re.search(r'<strong>(.*?)</strong>', inner_html, re.S | re.I)
-                    server_name = name_match.group(1).strip() if name_match else "Wecima Server"
-                    seen.add(raw_url)
-                    servers.append({"name": server_name, "url": raw_url, "type": "direct"})
-                    log("Wecima: Found raw server '{}' -> {}".format(server_name, raw_url[:60]))
+                    servers.append({
+                        "name": "Server Fallback",
+                        "url": decoded_url,
+                        "type": "direct"
+                    })
+                    log("Wecima: Found fallback server -> {}".format(decoded_url[:60]))
 
         if not servers:
             log("Wecima: ERROR - No servers found. The site layout may have changed.")
         else:
             log("Wecima: Successfully extracted {} servers".format(len(servers)))
-
         return servers
 
     def _extract_episode_cards(self, html):
@@ -496,13 +453,9 @@ class WecimaExtractor(BaseExtractor):
         return episodes
 
     def _parse_json_ld(self, html):
-        json_ld_match = re.search(
-            r'<script[^>]+type="application/ld\+json"[^>]*>(.*?)</script>',
-            html or "", re.S | re.I
-        )
+        json_ld_match = re.search(r'<script[^>]+type="application/ld\+json"[^>]*>(.*?)</script>', html or "", re.S | re.I)
         if not json_ld_match:
             return None
-
         try:
             data = json.loads(json_ld_match.group(1))
             return data
@@ -524,7 +477,6 @@ class WecimaExtractor(BaseExtractor):
                 name = item.get("name") or ""
                 if name and ("فيلم" in name or "مسلسل" in name):
                     return self._clean_title(name)
-
         patterns = [
             r'<h1[^>]+itemprop="name"[^>]*>(.*?)</h1>',
             r'<h1[^>]+class="[^"]*title[^"]*"[^>]*>(.*?)</h1>',
@@ -557,7 +509,6 @@ class WecimaExtractor(BaseExtractor):
                     desc = self._clean_html(item["description"])
                     if desc and len(desc) > 30:
                         return desc
-
         patterns = [
             r'<meta[^>]+itemprop="description"[^>]+content="([^"]+)"',
             r'property="og:description"[^>]+content="([^"]+)"',
@@ -586,7 +537,6 @@ class WecimaExtractor(BaseExtractor):
                         return self._normalize_url(poster)
                 if item.get("thumbnailUrl"):
                     return self._normalize_url(item["thumbnailUrl"])
-
         patterns = [
             r'property="og:image"[^>]+content="([^"]+)"',
             r'<meta[^>]+itemprop="thumbnailUrl"[^>]+content="([^"]+)"',
@@ -613,7 +563,6 @@ class WecimaExtractor(BaseExtractor):
                     year_match = re.search(r'(\d{4})', item["datePublished"])
                     if year_match:
                         return year_match.group(1)
-
         m = re.search(r'<span[^>]+class="year"[^>]*>\(?\s*(\d{4})\s*\)?</span>', html or "", re.I)
         if m:
             return m.group(1)
@@ -634,7 +583,6 @@ class WecimaExtractor(BaseExtractor):
                     rating = (item["aggregateRating"] or {}).get("ratingValue", "")
                     if rating:
                         return str(rating)
-
         m = re.search(r'"ratingValue"\s*:\s*"?(\d+(?:\.\d+)?)', html or "", re.I)
         if m:
             return m.group(1).replace("\\", "")
@@ -644,13 +592,44 @@ class WecimaExtractor(BaseExtractor):
         return ""
 
     def get_categories(self, mtype="movie"):
+        # FIX: Directly use the hardcoded Arabic URL-encoded paths to prevent mixing
         return [
-            {"title": "أفلام أجنبية",   "url": self._category_from_home("افلام اجنبي",   self.CATEGORY_FALLBACKS["افلام اجنبي"]),   "type": "category", "_action": "category"},
-            {"title": "أفلام عربية",    "url": self._category_from_home("افلام عربي",    self.CATEGORY_FALLBACKS["افلام عربي"]),    "type": "category", "_action": "category"},
-            {"title": "مسلسلات أجنبية", "url": self._category_from_home("مسلسلات اجنبي", self.CATEGORY_FALLBACKS["مسلسلات اجنبي"]), "type": "category", "_action": "category"},
-            {"title": "مسلسلات عربية",  "url": self._category_from_home("مسلسلات عربية", self.CATEGORY_FALLBACKS["مسلسلات عربية"]), "type": "category", "_action": "category"},
-            {"title": "كارتون وانمي",   "url": self._category_from_home("مسلسلات انمي",  self.CATEGORY_FALLBACKS["مسلسلات انمي"]),  "type": "category", "_action": "category"},
-            {"title": "ترند",           "url": self._category_from_home("تريندج",        self.CATEGORY_FALLBACKS["تريندج"]),        "type": "category", "_action": "category"},
+            {
+                "title": "أفلام أجنبية",
+                "url": self._normalize_url(self.CATEGORY_FALLBACKS["افلام اجنبي"]),
+                "type": "category",
+                "_action": "category"
+            },
+            {
+                "title": "أفلام عربية",
+                "url": self._normalize_url(self.CATEGORY_FALLBACKS["افلام عربي"]),
+                "type": "category",
+                "_action": "category"
+            },
+            {
+                "title": "مسلسلات أجنبية",
+                "url": self._normalize_url(self.CATEGORY_FALLBACKS["مسلسلات اجنبي"]),
+                "type": "category",
+                "_action": "category"
+            },
+            {
+                "title": "مسلسلات عربية",
+                "url": self._normalize_url(self.CATEGORY_FALLBACKS["مسلسلات عربية"]),
+                "type": "category",
+                "_action": "category"
+            },
+            {
+                "title": "كارتون وانمي",
+                "url": self._normalize_url(self.CATEGORY_FALLBACKS["مسلسلات انمي"]),
+                "type": "category",
+                "_action": "category"
+            },
+            {
+                "title": "ترند",
+                "url": self._normalize_url(self.CATEGORY_FALLBACKS["تريندج"]),
+                "type": "category",
+                "_action": "category"
+            },
         ]
 
     def get_category_items(self, url, page=1):
@@ -660,15 +639,21 @@ class WecimaExtractor(BaseExtractor):
             log("Wecima: category blocked {}".format(url))
             return []
         items = self._extract_cards(html)
-        next_page = self._extract_next_page(html)
+        next_page = self._extract_next_page(html, final_url or url)
         if next_page:
-            items.append({"title": "➡️ الصفحة التالية", "url": next_page, "type": "category", "_action": "category"})
+            items.append({
+                "title": "➡️ الصفحة التالية",
+                "url": next_page,
+                "type": "category",
+                "_action": "category"
+            })
         return items
 
     def search(self, query, page=1):
         base = self._get_base()
         items = []
         html = ""
+        final_url = ""
         for search_url in [
             self._search_url() + quote_plus(query),
             urljoin(base, "search/") + quote_plus(query),
@@ -682,9 +667,14 @@ class WecimaExtractor(BaseExtractor):
         log("Wecima: search '{}' -> {} items".format(query, len(items)))
         if not items:
             return []
-        next_page = self._extract_next_page(html)
+        next_page = self._extract_next_page(html, final_url)
         if next_page:
-            items.append({"title": "➡️ الصفحة التالية", "url": next_page, "type": "category", "_action": "category"})
+            items.append({
+                "title": "➡️ الصفحة التالية",
+                "url": next_page,
+                "type": "category",
+                "_action": "category"
+            })
         return items
 
     def get_page(self, url, m_type=None):
@@ -693,23 +683,19 @@ class WecimaExtractor(BaseExtractor):
         if self._is_blocked_page(html, final_url) or not html:
             log("Wecima: detail failed {}".format(url))
             return {"title": "Error", "servers": [], "items": [], "type": m_type or "movie"}
-
         title = self._detail_title(html)
         poster = self._detail_poster(html)
         plot = self._detail_plot(html)
         year = self._detail_year(title, html)
         rating = self._detail_rating(html)
-
         servers = self._extract_servers(html)
         episodes = [] if servers else self._extract_episode_cards(html)
         log("Wecima: detail {} -> servers={}, episodes={}".format(url, len(servers), len(episodes)))
-
         item_type = m_type or self._guess_type(title, final_url or url)
         if episodes:
             item_type = "series"
         elif servers and any(t in (title or "") for t in ("الحلقة", "حلقة")):
             item_type = "episode"
-
         return {
             "url": final_url or url,
             "title": title,
@@ -723,11 +709,7 @@ class WecimaExtractor(BaseExtractor):
         }
 
     def extract_stream(self, url):
-        """Delegate to base extractor for stream resolution.
-        The base extractor already handles direct m3u8/mp4 URLs from
-        tnmr.org, vibuxer.com, savefiles.com, delucloud.xyz,
-        sprintcdn/owphbf24.com, and mxcontent.net with proper
-        referer headers set to https://wecima.cx/.
-        """
         from .base import extract_stream as base_extract_stream
+        if "|" not in url and url.startswith("http"):
+            url += "|Referer=https://wecima.cx/"
         return base_extract_stream(url)
