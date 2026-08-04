@@ -21,6 +21,7 @@ import os
 import time
 import hashlib
 import threading
+import re
 
 try:
     import urllib2 as urllib_request
@@ -62,18 +63,11 @@ def getImagesDir():
 
 
 def guessExtFromUrl(url):
-    try:
-        low = (urlparse(url).path or "").lower()
-        if low.endswith(".png"):
-            return ".png"
-        if low.endswith(".webp"):
-            return ".webp"
-        if low.endswith(".jpeg"):
-            return ".jpg"
-        if low.endswith(".jpg"):
-            return ".jpg"
-    except Exception:
-        pass
+    # FIX: Always return .jpg because:
+    # 1. resizeCover() converts everything to JPEG via PIL when available
+    # 2. Enigma2's setPixmapFromFile() cannot decode WebP natively
+    # 3. A .jpg extension ensures Enigma2 tries JPEG decoding
+    # 4. downloadUrl() now tries .jpg URL fallback for WebP sources
     return ".jpg"
 
 
@@ -127,15 +121,48 @@ def writeFileAtomic(path, data):
 
 
 def downloadUrl(url, timeout=8):
+    # FIX: Added Referer header (some CDNs require it) and WebP-to-JPG
+    # URL fallback (Enigma2 can't display WebP natively, and PIL may not
+    # have libwebp support on embedded receivers).
     try:
         req = urllib_request.Request(url)
         req.add_header("User-Agent", "Mozilla/5.0")
+        # Send Referer matching the image's own domain
+        try:
+            parsed = urlparse(url)
+            referer = "{}://{}/".format(parsed.scheme, parsed.netloc)
+            req.add_header("Referer", referer)
+        except Exception:
+            pass
         response = urllib_request.urlopen(req, timeout=timeout)
         data = response.read()
         if data:
             return data
     except Exception:
-        return None
+        pass
+
+    # If the URL is WebP, try requesting the .jpg version — Wecima/WordPress
+    # typically serves both formats. This is the critical fallback for
+    # receivers without PIL WebP support.
+    if url and '.webp' in url.lower():
+        try:
+            jpg_url = re.sub(r'\.webp(\?.*)?$', r'.jpg\1', url, flags=re.I)
+            if jpg_url != url:
+                req2 = urllib_request.Request(jpg_url)
+                req2.add_header("User-Agent", "Mozilla/5.0")
+                try:
+                    parsed = urlparse(jpg_url)
+                    referer = "{}://{}/".format(parsed.scheme, parsed.netloc)
+                    req2.add_header("Referer", referer)
+                except Exception:
+                    pass
+                response = urllib_request.urlopen(req2, timeout=timeout)
+                data = response.read()
+                if data:
+                    return data
+        except Exception:
+            pass
+
     return None
 
 
