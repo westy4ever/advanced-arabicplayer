@@ -32,13 +32,15 @@ class WecimaExtractor(BaseExtractor):
     VALID_HOST_MARKERS = ("wecima.click", "wecima.cx", "wecima.bid", "wecima.site")
     BLOCKED_HOST_MARKERS = ("alliance4creativity.com",)
 
-    # FIX: Hardcode the exact Arabic URL-encoded paths to prevent categories from mixing
+    # FIX: Use the actual English-slug URLs the site uses (confirmed via network log).
+    # The old Arabic-encoded paths returned 404/redirect, producing zero cards.
     CATEGORY_FALLBACKS = {
-        "افلام اجنبي":    "/category/%d8%a7%d9%81%d9%84%d8%a7%d9%85-%d8%a7%d8%ac%d9%86%d8%a8%d9%8a/",
-        "افلام عربي":     "/category/%d8%a7%d9%81%d9%84%d8%a7%d9%85-%d8%b9%d8%b1%d8%a8%d9%8a/",
-        "مسلسلات اجنبي":  "/category/%d9%85%d8%b3%d9%84%d8%b3%d9%84%d8%a7%d8%aa-%d8%a7%d8%ac%d9%86%d8%a8%d9%8a/",
-        "مسلسلات عربية":  "/category/%d9%85%d8%b3%d9%84%d8%b3%d9%84%d8%a7%d8%aa-%d8%b9%d8%b1%d8%a8%d9%8a/",
-        "مسلسلات انمي":   "/category/%d9%85%d8%b3%d9%84%d8%b3%d9%84%d8%a7%d8%aa-%d8%a7%d9%86%d9%85%d9%8a/",
+        "افلام اجنبي":    "/category/foreign-movies/",
+        "افلام عربي":     "/category/arabic-movies/",
+        "افلام انمي":     "/category/anime-movies/",
+        "مسلسلات اجنبي":  "/category/foreign-series/",
+        "مسلسلات عربية":  "/category/arabic-series/",
+        "مسلسلات انمي":   "/category/anime-series/",
         "تريندج":         "/trends/",
     }
 
@@ -263,15 +265,29 @@ class WecimaExtractor(BaseExtractor):
                 year = year_match.group(1)
             
             poster = ""
-            poster_match = re.search(r'(?:data-src|src)="([^"]*(?:wp-content/uploads|/upload/)[^"]+)"', block, re.I)
+            # FIX: Check multiple lazy-loading attributes and both quote styles.
+            # The old regex only checked data-src/src with double quotes and missed
+            # data-lazy-src, data-original, and CSS background-image patterns that
+            # Wecima's modern theme uses.
+            poster_match = re.search(
+                r'(?:data-src|data-lazy-src|data-original|src)=["\']([^"\']*(?:wp-content/uploads|/upload/)[^"\']+)["\']',
+                block, re.I
+            )
             if not poster_match:
-                poster_match = re.search(r'(?:data-src|src)="([^"]+\.(?:jpg|jpeg|png|webp))"', block, re.I)
+                poster_match = re.search(
+                    r'(?:data-src|data-lazy-src|data-original|src)=["\']([^"\']+\.(?:jpg|jpeg|png|webp)[^"\']*)["\']',
+                    block, re.I
+                )
             if not poster_match:
-                poster_match = re.search(r'style="[^"]*--image:url\(([^)]+)\)', block, re.I)
-                if poster_match:
-                    poster = poster_match.group(1).strip("'\" ")
+                # CSS custom property or background-image with single/double/no quotes
+                poster_match = re.search(
+                    r'style=["\'][^"\']*(?:--image|background-image)\s*:\s*url\(\s*["\']?([^)"\']+)',
+                    block, re.I
+                )
+            if poster_match:
+                poster = poster_match.group(1).strip("'\" ")
             else:
-                poster = poster_match.group(1)
+                poster = ""
             
             seen.add(url)
             cards.append({
@@ -592,7 +608,6 @@ class WecimaExtractor(BaseExtractor):
         return ""
 
     def get_categories(self, mtype="movie"):
-        # FIX: Directly use the hardcoded Arabic URL-encoded paths to prevent mixing
         return [
             {
                 "title": "أفلام أجنبية",
@@ -603,6 +618,12 @@ class WecimaExtractor(BaseExtractor):
             {
                 "title": "أفلام عربية",
                 "url": self._normalize_url(self.CATEGORY_FALLBACKS["افلام عربي"]),
+                "type": "category",
+                "_action": "category"
+            },
+            {
+                "title": "أفلام انمي",
+                "url": self._normalize_url(self.CATEGORY_FALLBACKS["افلام انمي"]),
                 "type": "category",
                 "_action": "category"
             },
@@ -619,7 +640,7 @@ class WecimaExtractor(BaseExtractor):
                 "_action": "category"
             },
             {
-                "title": "كارتون وانمي",
+                "title": "مسلسلات انمي",
                 "url": self._normalize_url(self.CATEGORY_FALLBACKS["مسلسلات انمي"]),
                 "type": "category",
                 "_action": "category"
