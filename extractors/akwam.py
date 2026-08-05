@@ -1,35 +1,74 @@
 # -*- coding: utf-8 -*-
 """
-Extractor for Akwam - akwam.com.co/
-Now supports multi-quality: shows all available video qualities as separate server entries.
+Extractor for Akwam - Multi-domain support
+Updated for akwam.it layout, categories, and stream extraction.
 Inherits from BaseExtractor.
 """
 
 import re
 import sys
-from .base import BaseExtractor, fetch, log
-from urllib.parse import urljoin, urlparse, quote_plus, quote, unquote
-
-if sys.version_info[0] == 3:
-    from urllib.parse import quote_plus, urlparse, quote, unquote
-else:
-    from urllib import quote_plus, quote
-    from urlparse import urlparse
+from .base import BaseExtractor, fetch, log, urljoin
 
 
 class AkwamExtractor(BaseExtractor):
-    """Extractor for Akwam - akwam.com.co/"""
+    """Extractor for Akwam - supports multiple domains"""
     
-    MAIN_URL = "https://akwam.com.co/"
+    MAIN_URL = "https://akwam.it/"
+    
+    DOMAINS = [
+        "https://akwam.it/",
+        "https://akwam.co/",
+        "https://akwam.cx/",
+        "https://akwam.to/",
+        "https://akwam.run/",
+        "https://akwam.one/",
+        "https://akwam.net/",
+        "https://akwam.com.co/",
+    ]
     
     def __init__(self):
         super(AkwamExtractor, self).__init__()
         self.main_url = self.MAIN_URL
-        self._resolved_base = self.MAIN_URL
+        self._resolved_base = None
     
     def _get_base(self):
-        return self._resolved_base or self.MAIN_URL
-    
+        """Probe known domains and return the first working one."""
+        if self._resolved_base:
+            return self._resolved_base
+        
+        for domain in self.DOMAINS:
+            try:
+                log("Akwam: Probing domain {}".format(domain))
+                html, final_url = fetch(domain, referer=domain)
+                if not html:
+                    continue
+                
+                # Check for Cloudflare or dead redirects
+                lower_html = html.lower()
+                if "just a moment" in lower_html or "cf-chl" in lower_html:
+                    log("Akwam: Domain {} blocked by Cloudflare".format(domain))
+                    continue
+                
+                # Check if it redirected away to a non-akwam domain
+                final_host = re.search(r'https?://([^/]+)', final_url or "")
+                if final_host and not any(d in final_host.group(1) for d in ("akwam", "akoam")):
+                    log("Akwam: Domain {} redirected to unknown host {}".format(domain, final_host.group(1)))
+                    continue
+
+                # If it passes all checks, use this domain
+                self._resolved_base = domain
+                self.main_url = domain
+                log("Akwam: Selected working domain: {}".format(domain))
+                return self._resolved_base
+            except Exception as e:
+                log("Akwam: Domain {} failed with error: {}".format(domain, e))
+                continue
+
+        # Fallback if all fail
+        log("Akwam: All domains failed, falling back to {}".format(self.MAIN_URL))
+        self._resolved_base = self.MAIN_URL
+        return self._resolved_base
+
     def _clean_title(self, title):
         if not title:
             return ""
@@ -49,28 +88,35 @@ class AkwamExtractor(BaseExtractor):
         url = url.replace('&amp;', '&')
         
         if "downet.net" in url:
-            return url.replace(" ", "%20")
+            url = url.replace(" ", "%20")
+            
+        if url.startswith("//"):
+            return "https:" + url
+        if not url.startswith("http"):
+            return urljoin(self._get_base(), url)
         
-        try:
-            raw_url = unquote(url)
-            return quote(raw_url, safe=':/?&=#+')
-        except Exception:
-            return url
+        return url
     
     def get_categories(self, mtype="movie"):
-        """Return all available categories."""
+        """Return all available categories based on the new akwam.it layout."""
+        base = self._get_base()
         return [
-            {"title": "🎬 English Movies", "url": urljoin(self._get_base(), "movies?section=30"), "type": "category", "_action": "category"},
-            {"title": "🎬 Arabic Movies", "url": urljoin(self._get_base(), "movies?section=29"), "type": "category", "_action": "category"},
-            {"title": "🎬 Indian Movies", "url": urljoin(self._get_base(), "movies?section=31"), "type": "category", "_action": "category"},
-            {"title": "🎬 Turkish Movies", "url": urljoin(self._get_base(), "movies?section=32"), "type": "category", "_action": "category"},
-            {"title": "🎬 Asian Movies", "url": urljoin(self._get_base(), "movies?section=33"), "type": "category", "_action": "category"},
-            {"title": "🎬 Anime Movies", "url": urljoin(self._get_base(), "movies?category=30"), "type": "category", "_action": "category"},
-            {"title": "🎬 Netflix Movies", "url": urljoin(self._get_base(), "movies?category=72"), "type": "category", "_action": "category"},
-            {"title": "📺 TV Series", "url": urljoin(self._get_base(), "series"), "type": "category", "_action": "category"},
-            {"title": "📡 TV Shows", "url": urljoin(self._get_base(), "shows"), "type": "category", "_action": "category"},
-            {"title": "🎭 Variety", "url": urljoin(self._get_base(), "mix"), "type": "category", "_action": "category"},
-            {"title": "🆕 Recent", "url": urljoin(self._get_base(), "recent"), "type": "category", "_action": "category"},
+            {"title": "🎬 English Movies", "url": urljoin(base, "movies?section=30&category=0"), "type": "category", "_action": "category"},
+            {"title": "🎬 Arabic Movies", "url": urljoin(base, "movies?section=29&category=0"), "type": "category", "_action": "category"},
+            {"title": "🎬 Indian Movies", "url": urljoin(base, "movies?section=31&category=0"), "type": "category", "_action": "category"},
+            {"title": "🎬 Turkish Movies", "url": urljoin(base, "movies?section=32&category=0"), "type": "category", "_action": "category"},
+            {"title": "🎬 Asian Movies", "url": urljoin(base, "movies?section=33&category=0"), "type": "category", "_action": "category"},
+            {"title": "🎬 Anime Movies", "url": urljoin(base, "movies?section=30&category=30"), "type": "category", "_action": "category"},
+            {"title": "🎬 Netflix Movies", "url": urljoin(base, "movies?section=30&category=72"), "type": "category", "_action": "category"},
+            {"title": "📺 English Series", "url": urljoin(base, "series?section=30&category=0"), "type": "category", "_action": "category"},
+            {"title": "📺 Arabic Series", "url": urljoin(base, "series?section=29&category=0"), "type": "category", "_action": "category"},
+            {"title": "📺 Turkish Series", "url": urljoin(base, "series?section=32&category=0"), "type": "category", "_action": "category"},
+            {"title": "📺 Anime Series", "url": urljoin(base, "series?section=30&category=30"), "type": "category", "_action": "category"},
+            {"title": "📡 TV Shows", "url": urljoin(base, "shows"), "type": "category", "_action": "category"},
+            {"title": "🤼 Wrestling Shows", "url": urljoin(base, "shows?section=43&category=0"), "type": "category", "_action": "category"},
+            {"title": "🎞️ Documentary Shows", "url": urljoin(base, "shows?section=46&category=0"), "type": "category", "_action": "category"},
+            {"title": "🎭 Variety", "url": urljoin(base, "mix"), "type": "category", "_action": "category"},
+            {"title": "🆕 Recent", "url": urljoin(base, "recent"), "type": "category", "_action": "category"},
         ]
     
     def get_category_items(self, url, page=1):
@@ -105,29 +151,43 @@ class AkwamExtractor(BaseExtractor):
             "_action": "separator",
         })
     
-        entry_boxes = re.split(r'<div class="entry-box entry-box-1">', html)
-        
+        # Broader split for entry boxes to handle slight class name changes
+        entry_boxes = re.split(r'<div class="entry-box', html)
         log("Akwam: Found {} entry-box sections".format(len(entry_boxes) - 1))
         
         for box in entry_boxes[1:]:
-            title_match = re.search(r'<h3[^>]*class="[^"]*entry-title[^"]*"[^>]*>.*?<a\s+href="([^"]+)"[^>]*class="[^"]*text-white[^"]*"[^>]*>([^<]+)</a>', box, re.S | re.I)
-            
-            if not title_match:
+            # Find the main link
+            link_match = re.search(r'<a\s+href="([^"]+)"', box, re.I)
+            if not link_match:
                 continue
                 
-            movie_url = title_match.group(1)
-            title = title_match.group(2).strip()
+            movie_url = link_match.group(1)
             
-            if movie_url in seen:
+            # Filter out non-content links
+            if any(x in movie_url for x in ('/category/', '/page/', '/recent', '/movies', '/series', '/shows', '/mix', '#')):
                 continue
-            seen.add(movie_url)
-            
+                
             full_url = self._normalize_url(movie_url)
+            if not full_url or full_url in seen:
+                continue
+                
+            title = ""
+            title_match = re.search(r'<h3[^>]*>(.*?)</h3>', box, re.S | re.I)
+            if title_match:
+                title = re.sub(r'<[^>]+>', '', title_match.group(1)).strip()
+            else:
+                # fallback to alt or title attr
+                title_match = re.search(r'(?:alt|title)="([^"]+)"', box, re.I)
+                if title_match:
+                    title = title_match.group(1)
+            
+            if not title:
+                continue
+                
+            seen.add(full_url)
             
             poster = ""
-            img_match = re.search(r'data-src="([^"]+)"', box, re.I)
-            if not img_match:
-                img_match = re.search(r'src="([^"]+)"', box, re.I)
+            img_match = re.search(r'<img[^>]+(?:data-src|data-lazy-src|data-original|src)="([^"]+)"', box, re.I)
             if img_match:
                 poster = img_match.group(1)
                 if "placeholder" in poster.lower():
@@ -149,6 +209,8 @@ class AkwamExtractor(BaseExtractor):
         next_page_num = current_page + 1
         
         next_match = re.search(r'<a\s+class="page-link"[^>]+href="([^"]+)"[^>]*>{}</a>'.format(next_page_num), html, re.I)
+        if not next_match:
+            next_match = re.search(r'<a\s+[^>]*href="([^"]+)"[^>]*>.*?التالي.*?</a>', html, re.I | re.S)
         
         if next_match:
             next_url = self._normalize_url(next_match.group(1))
@@ -165,28 +227,43 @@ class AkwamExtractor(BaseExtractor):
         return items
     
     def search(self, query, page=1):
-        search_url = urljoin(self._get_base(), "search?q=" + query.replace(" ", "+"))
+        base = self._get_base()
+        search_url = urljoin(base, "search?q=" + query.replace(" ", "+"))
         if page > 1:
-            search_url = urljoin(self._get_base(), "search?q={}&page={}".format(query.replace(" ", "+"), page))
+            search_url = urljoin(base, "search?q={}&page={}".format(query.replace(" ", "+"), page))
     
         log("Akwam: Searching for: {}".format(query))
         
-        html, _ = fetch(search_url, referer=self._get_base())
+        html, _ = fetch(search_url, referer=base)
         if not html:
             return []
     
         items = []
-        
-        entry_boxes = re.split(r'<div class="entry-box entry-box-1">', html)
+        entry_boxes = re.split(r'<div class="entry-box', html)
         
         for box in entry_boxes[1:]:
-            title_match = re.search(r'<h3[^>]*class="[^"]*entry-title[^"]*"[^>]*>.*?<a\s+href="([^"]+)"[^>]*class="[^"]*text-white[^"]*"[^>]*>([^<]+)</a>', box, re.S | re.I)
+            link_match = re.search(r'<a\s+href="([^"]+)"', box, re.I)
+            if not link_match:
+                continue
+                
+            movie_url = link_match.group(1)
+            if any(x in movie_url for x in ('/category/', '/page/', '/recent', '/movies', '/series', '/shows', '/mix', '#')):
+                continue
+                
+            full_url = self._normalize_url(movie_url)
+            title = ""
+            title_match = re.search(r'<h3[^>]*>(.*?)</h3>', box, re.S | re.I)
             if title_match:
-                movie_url = title_match.group(1)
-                title = title_match.group(2).strip()
+                title = re.sub(r'<[^>]+>', '', title_match.group(1)).strip()
+            else:
+                title_match = re.search(r'(?:alt|title)="([^"]+)"', box, re.I)
+                if title_match:
+                    title = title_match.group(1)
+            
+            if title and full_url:
                 items.append({
                     "title": self._clean_title(title),
-                    "url": self._normalize_url(movie_url),
+                    "url": full_url,
                     "poster": "",
                     "type": "movie",
                     "_action": "details",
@@ -229,61 +306,107 @@ class AkwamExtractor(BaseExtractor):
             result["plot"] = self._clean_title(plot_match.group(1))
     
         watch_url = None
-        watch_link_match = re.search(r'href="(https?://akwam\.com\.co/watch/\d+)"', html, re.I)
-        if watch_link_match:
-            watch_url = watch_link_match.group(1)
-        else:
-            base = url.rstrip('/')
-            watch_url = base + '/watch'
+        watch_html = html
         
-        if watch_url:
-            log("Akwam: Fetching watch page: {}".format(watch_url))
-            watch_html, _ = fetch(watch_url, referer=url)
-            if watch_html:
-                source_matches = re.findall(r'<source\s+src="([^"]+)"\s+type="video/mp4"[^>]*>', watch_html, re.I)
-                if not source_matches:
-                    source_matches = re.findall(r'<source\s+src="([^"]+)"', watch_html, re.I)
-                
-                if source_matches:
-                    seen = set()
-                    for src in source_matches:
-                        video_url = src.strip()
-                        if video_url in seen:
-                            continue
-                        seen.add(video_url)
-                        
-                        quality = "HD"
-                        lowered = video_url.lower()
-                        if "1080" in lowered:
-                            quality = "1080p"
-                        elif "720" in lowered:
-                            quality = "720p"
-                        elif "480" in lowered:
-                            quality = "480p"
-                        
-                        if '|' in video_url:
-                            video_url = video_url.split('|')[0]
-                        
-                        if "downet.net" in video_url:
-                            video_url = video_url.replace(" ", "%20")
-                        
-                        try:
-                            raw_url = unquote(video_url)
-                            video_url = quote(raw_url, safe=':/?&=#+')
-                        except Exception:
-                            pass
-                        
-                        result["servers"].append({
-                            "name": "🎬 {} - Akwam".format(quality),
-                            "url": video_url,
-                            "type": "direct"
-                        })
-                        log("Akwam: Added {} quality: {}".format(quality, video_url[:80]))
+        # If the current URL is not a watch page, try to find the watch link
+        if "/watch/" not in url:
+            # Aggressive search for the watch URL anywhere in the HTML
+            watch_match = re.search(r'(https?://[^"\'\s<>]+/watch/\d+)', html, re.I)
+            if watch_match:
+                watch_url = watch_match.group(1)
+            else:
+                rel_watch_match = re.search(r'href="(/watch/\d+)"', html, re.I)
+                if rel_watch_match:
+                    watch_url = self._normalize_url(rel_watch_match.group(1))
+            
+            if watch_url:
+                log("Akwam: Fetching watch page: {}".format(watch_url))
+                watch_html, _ = fetch(watch_url, referer=url)
+        
+        if watch_html:
+            source_matches = []
+            
+            # 1. Akwam's specific downet.net links (catches vlc://, intent:, and missing colon https//)
+            # Stops matching at .mp4 to avoid capturing Android intent (#) garbage
+            raw_links = re.findall(r'(https?:?//[^"\'\s<>#]+\.downet\.net/[^"\'\s<>#]+\.mp4)', watch_html, re.I)
+            for m in raw_links:
+                if m.startswith("https//"):
+                    m = "https://" + m[6:]
+                elif m.startswith("http//"):
+                    m = "http://" + m[5:]
+                source_matches.append(m)
+
+            # 2. Standard <source> tags (STRICTLY require .mp4 or .m3u8 to ignore images)
+            if not source_matches:
+                source_matches = re.findall(r'<source\s+src="([^"]+\.(?:mp4|m3u8)[^"]*)"', watch_html, re.I)
+            
+            # 3. Fallback to JS-based sources (STRICTLY require .mp4 or .m3u8 to ignore images)
+            if not source_matches:
+                for pattern in [
+                    r'file\s*:\s*["\']([^"\']+\.(?:mp4|m3u8)[^"\']*)["\']',
+                    r'source\s*:\s*["\']([^"\']+\.(?:mp4|m3u8)[^"\']*)["\']',
+                    r'data-(?:url|src|video)=["\']([^"\']+\.(?:mp4|m3u8)[^"\']*)["\']',
+                    r'"(?:file|src|url)"\s*:\s*"([^"]+\.(?:mp4|m3u8)[^"]*)"',
+                ]:
+                    source_matches = re.findall(pattern, watch_html, re.I)
+                    if source_matches:
+                        break
+            
+            if source_matches:
+                seen_urls = set()
+                seen_qualities = set()
+                for src in source_matches:
+                    video_url = src.strip()
+                    if video_url in seen_urls:
+                        continue
+                    seen_urls.add(video_url)
                     
-                    log("Akwam: Found {} quality variants".format(len(result["servers"])))
-                    return result
+                    quality = "HD"
+                    lowered = video_url.lower()
+                    if "1080" in lowered:
+                        quality = "1080p"
+                    elif "720" in lowered:
+                        quality = "720p"
+                    elif "480" in lowered:
+                        quality = "480p"
+                    
+                    # Deduplicate by quality so we don't get 14 different CDNs for 720p
+                    if quality in seen_qualities:
+                        continue
+                    seen_qualities.add(quality)
+                    
+                    if '|' in video_url:
+                        video_url = video_url.split('|')[0]
+                    
+                    if "downet.net" in video_url:
+                        video_url = video_url.replace(" ", "%20")
+                    
+                    video_url = self._normalize_url(video_url)
+                    
+                    result["servers"].append({
+                        "name": "🎬 {} - Akwam".format(quality),
+                        "url": video_url,
+                        "type": "direct"
+                    })
+                    log("Akwam: Added {} quality: {}".format(quality, video_url[:80]))
+                
+                log("Akwam: Found {} quality variants".format(len(result["servers"])))
+                return result
+            else:
+                # Fallback: iframes (embedded players)
+                iframe_matches = re.findall(r'<iframe[^>]+src="([^"]+)"', watch_html, re.I)
+                for iframe_url in iframe_matches:
+                    if any(x in iframe_url.lower() for x in ('youtube', 'facebook', 'twitter')):
+                        continue
+                    full_url = self._normalize_url(iframe_url)
+                    result["servers"].append({
+                        "name": "🎬 Embed Player",
+                        "url": full_url,
+                        "type": "embed"
+                    })
     
-        watch_match = re.search(r'href="(https?://go\.akwam\.com\.co/watch/\d+)"', html, re.I)
+        # Domain-agnostic regex for go.akwam redirect
+        watch_match = re.search(r'href="(https?://go\.[^"]*akwam[^"]*/watch/\d+)"', html, re.I)
         if watch_match:
             normalized_url = self._normalize_url(watch_match.group(1))
             if normalized_url:
