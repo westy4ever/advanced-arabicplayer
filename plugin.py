@@ -2503,6 +2503,7 @@ class AdvancedArabicPlayerSimplePlayer(Screen):
             self.sref.setName(self.title.encode("utf-8", "ignore"))
 
         self["status"].setText("جاري التشغيل... {}".format(label))
+        self.__showOSD(False)  # <--- ADD THIS LINE (False means DO NOT auto-hide yet)
         my_log("Play attempt: {}".format(label))
         try:
             self.session.nav.stopService()
