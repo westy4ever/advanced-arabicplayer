@@ -11,7 +11,7 @@ check the local cache instantly (no network call from the Enigma2 UI
 thread), and requestImageAsync()/requestImageAsyncPriority() to queue a
 background download if it's not cached yet. There is no completion
 callback - callers are expected to poll getCachedImage() again on a
-short timer (see AdvancedArabicPlayerHome._posterPollTimer in plugin.py),
+short timer (see AdvancedArabicPlayerHome._artworkPollTimer in plugin.py),
 which is the same pattern the source plugin's carousel screens use.
 """
 
@@ -63,11 +63,11 @@ def getImagesDir():
 
 
 def guessExtFromUrl(url):
-    # FIX: Always return .jpg because:
+    # Always return .jpg because:
     # 1. resizeCover() converts everything to JPEG via PIL when available
     # 2. Enigma2's setPixmapFromFile() cannot decode WebP natively
     # 3. A .jpg extension ensures Enigma2 tries JPEG decoding
-    # 4. downloadUrl() now tries .jpg URL fallback for WebP sources
+    # 4. downloadUrl() now tries a .jpg URL fallback for WebP sources
     return ".jpg"
 
 
@@ -121,13 +121,13 @@ def writeFileAtomic(path, data):
 
 
 def downloadUrl(url, timeout=8):
-    # FIX: Added Referer header (some CDNs require it) and WebP-to-JPG
-    # URL fallback (Enigma2 can't display WebP natively, and PIL may not
-    # have libwebp support on embedded receivers).
+    # Added Referer header (some CDNs require it) and a WebP-to-JPG URL
+    # fallback (Enigma2 can't display WebP natively, and PIL may not have
+    # libwebp support on embedded receivers) - matches the same fix
+    # already used by plugin_util.py's _fetch_poster_bytes.
     try:
         req = urllib_request.Request(url)
         req.add_header("User-Agent", "Mozilla/5.0")
-        # Send Referer matching the image's own domain
         try:
             parsed = urlparse(url)
             referer = "{}://{}/".format(parsed.scheme, parsed.netloc)
@@ -141,12 +141,11 @@ def downloadUrl(url, timeout=8):
     except Exception:
         pass
 
-    # If the URL is WebP, try requesting the .jpg version — Wecima/WordPress
-    # typically serves both formats. This is the critical fallback for
-    # receivers without PIL WebP support.
-    if url and '.webp' in url.lower():
+    # If the URL is WebP, try requesting the .jpg version - many
+    # WordPress/CDN sites serve both formats at the same path.
+    if url and ".webp" in url.lower():
         try:
-            jpg_url = re.sub(r'\.webp(\?.*)?$', r'.jpg\1', url, flags=re.I)
+            jpg_url = re.sub(r"\.webp(\?.*)?$", r".jpg\1", url, flags=re.I)
             if jpg_url != url:
                 req2 = urllib_request.Request(jpg_url)
                 req2.add_header("User-Agent", "Mozilla/5.0")
@@ -173,26 +172,45 @@ def resizeCover(data, target_size):
     don't reliably aspect-scale a mismatched-size image into a fixed box
     on their own - without this, posters can end up stretched or
     effectively "zoomed in" depending on the receiver's image/skin
-    engine. Falls back to the original bytes if PIL isn't available or
-    the image can't be decoded.
+    engine. 
+    
+    Returns None if the data is corrupt/truncated so the caller doesn't cache it.
+    Falls back to the original bytes only if PIL isn't installed at all.
     """
     if not target_size:
         return data
+        
     try:
         from PIL import Image
         import io
+    except ImportError:
+        # PIL is not installed on this system. We must fall back to the 
+        # raw bytes because we cannot validate or resize them.
+        return data
+        
+    try:
         img = Image.open(io.BytesIO(data))
         img = img.convert("RGB")
+        
+        # Force full decode! This catches truncated downloads that 
+        # Image.open() would otherwise miss until it's too late.
+        img.load() 
+        
         try:
             from PIL import ImageOps
             fitted = ImageOps.fit(img, target_size, Image.LANCZOS)
         except Exception:
             fitted = img.resize(target_size, Image.LANCZOS)
+            
         out = io.BytesIO()
         fitted.save(out, format="JPEG", quality=88)
         return out.getvalue()
+        
     except Exception:
-        return data
+        # PIL IS installed, but failed to decode/load/resize the data.
+        # This means the data is genuinely corrupt or truncated.
+        # Return None to signal failure so the caller SKIPS caching it.
+        return None
 
 
 # ─── Non-blocking image cache ────────────────────────────────────────────────
@@ -279,8 +297,13 @@ def _async_worker_loop():
                     pass
                 if data:
                     if target_size:
-                        data = resizeCover(data, target_size)
-                    writeFileAtomic(cache_path, data)
+                        processed_data = resizeCover(data, target_size)
+                    else:
+                        processed_data = data
+                        
+                    # Only cache if resizeCover didn't signal corruption (None)
+                    if processed_data is not None:
+                        writeFileAtomic(cache_path, processed_data)
             except Exception:
                 pass
             _mark_async_done(cache_path)
