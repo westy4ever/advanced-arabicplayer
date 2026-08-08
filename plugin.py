@@ -414,9 +414,11 @@ class AdvancedArabicPlayerHome(Screen):
         <widget name="title_text" position="45,6"    size="1100,36" font="Regular;28" foregroundColor="#00E5FF" transparent="1" zPosition="7" />
         <widget name="status"     position="1150,8"  size="725,30"  font="Regular;22" foregroundColor="#FFD740" transparent="1" halign="right" zPosition="7" />
         
-        <!-- XtreamNew Feature: Dynamic Plot & Meta Text -->
-        <widget name="info_meta" position="40,830" size="1840,35" font="Regular;24" foregroundColor="#FFD740" transparent="1" zPosition="5" halign="center" />
-        <widget name="info_plot" position="40,865" size="1840,90" font="Regular;22" foregroundColor="#8B949E" transparent="1" zPosition="5" halign="center" valign="top" />
+        <!-- Title / Meta / Plot - carousel view ONLY, shown in the blank
+             area above the carousel so it never overlaps the poster art. -->
+        <widget name="content_title" position="40,95"  size="1200,50"  font="Bold;38" foregroundColor="#00E5FF" transparent="1" zPosition="5" halign="left" valign="top" />
+        <widget name="info_meta"     position="40,150" size="1200,35"  font="Regular;24" foregroundColor="#FFD740" transparent="1" zPosition="5" halign="left" />
+        <widget name="info_plot"     position="40,190" size="1200,230" font="Regular;22" foregroundColor="#39D98A" transparent="1" zPosition="5" halign="left" valign="top" />
         
         <widget name="home_grid" position="20,90" size="1880,900" scrollbarMode="showNever" transparent="1" zPosition="3" />
         {home_grid_pics}
@@ -480,6 +482,7 @@ class AdvancedArabicPlayerHome(Screen):
         self["title_bar"]  = Label("")
         self["title_text"] = Label("Advanced Arabic Player  v{}".format(_PLUGIN_VERSION))
         self["status"]     = Label("جاري التحميل...")
+        self["content_title"] = Label("")
         self["info_meta"]  = Label("")
         self["info_plot"]  = Label("")
         self["btn_bar"]    = Label("")
@@ -614,6 +617,7 @@ class AdvancedArabicPlayerHome(Screen):
         self.gridFocusBlinkTimer.stop()
         self["backdropImg"].hide()
         self["shade_overlay"].hide()
+        self["content_title"].hide()
         self["info_meta"].hide()
         self["info_plot"].hide()
         self._current_backdrop_path = ""
@@ -647,16 +651,13 @@ class AdvancedArabicPlayerHome(Screen):
 
     def _showPosterMode(self):
         self["home_grid"].hide()
-        self["shade_overlay"].show()
-        self["info_meta"].show()
-        self["info_plot"].show()
         for i in range(HOME_GRID_ROWS):
             for _c in range(HOME_GRID_COLS):
                 self["pic_%d_%d" % (i, _c)].hide()
-        
+
         self.carouselFocusBlinkTimer.stop()
         self.gridFocusBlinkTimer.stop()
-        
+
         for i in range(self.carousel_slots):
             self["cfocus%d" % i].hide()
             self["cposter%d" % i].hide()
@@ -671,16 +672,21 @@ class AdvancedArabicPlayerHome(Screen):
 
         if self._layout_style == "grid":
             self["poster_grid"].show()
-            for i in range(self.carousel_slots):
-                self["cfocus%d" % i].hide()
-                self["cposter%d" % i].hide()
-                self["cposterImg%d" % i].hide()
-                self["cfavMark%d" % i].hide()
-                self["cratingBadge%d" % i].hide()
-                self["cresumeMark%d" % i].hide()
+            # Fanart / title / meta / plot are a carousel-only feature -
+            # the poster grid deliberately shows neither, per design.
+            self["backdropImg"].hide()
+            self["shade_overlay"].hide()
+            self["content_title"].hide()
+            self["info_meta"].hide()
+            self["info_plot"].hide()
+            self._current_backdrop_path = ""
             self["key_green"].setText("تبديل العرض (Carousel)")
             self._gridFocusBlink()
         else:
+            self["shade_overlay"].show()
+            self["content_title"].show()
+            self["info_meta"].show()
+            self["info_plot"].show()
             for i in range(self.carousel_slots):
                 self["cposter%d" % i].show()
             self._applyCarouselGeometry()
@@ -848,60 +854,76 @@ class AdvancedArabicPlayerHome(Screen):
                     widget.hide()
                     plugin_imagecache.requestImageAsync(url, target_size=(POSTER_W, POSTER_H))
 
-    # --- Shared Backdrop Logic (with TMDB Fanart & Dynamic Plot) ---
+    # --- Shared Backdrop / Title / Plot Logic (carousel view only) ---
     def _updateBackdrop(self, skip_tmdb=False):
-        if self._display_mode != "poster":
+        # Fanart, the movie/media title, and the plot text are a
+        # carousel-only feature - the poster grid intentionally shows
+        # none of them, so bail out immediately for any other mode.
+        if self._display_mode != "poster" or self._layout_style != "carousel":
             self["backdropImg"].hide()
+            self["content_title"].setText("")
             self["info_meta"].setText("")
             self["info_plot"].setText("")
+            self._current_backdrop_path = ""
             return
 
-        if self._layout_style == "grid":
-            item = self["poster_grid"].getCurrent()
+        if not (0 <= getattr(self, 'index', -1) < len(self._items)):
+            item = None
         else:
-            if not (0 <= getattr(self, 'index', -1) < len(self._items)): item = None
-            else: item = self._items[self.index]
+            item = self._items[self.index]
 
         if not skip_tmdb:
             self._tmdb_token += 1
 
         if not item or item.get("_is_next_page") or item.get("_is_prev_page"):
             self["backdropImg"].hide()
+            self["content_title"].setText("")
             self["info_meta"].setText("")
             self["info_plot"].setText("")
             self._current_backdrop_path = ""
             return
-            
+
+        # Movie/media name - shown instantly from the scraped item title,
+        # no need to wait on a background TMDb call for this part.
+        display_title = _strip_arabic_from_english_title(item.get("title", "") or "")
+        self["content_title"].setText(_single_line_text(display_title, width=42, fallback=""))
+
         if not skip_tmdb:
             # XtreamNew Feature: Update Dynamic Plot Text instantly (in background)
             current_token = self._tmdb_token
             threading.Thread(target=self._bgFetchTmdbText, args=(item, current_token)).start()
-            
+
         backdrop_url = item.get("fanart") or item.get("backdrop") or ""
         poster_url = item.get("poster") or ""
         target_url = backdrop_url or poster_url
-        
-        if target_url:
+
+        if not target_url:
+            my_log("_updateBackdrop: no fanart/backdrop/poster URL on item '{}'".format(item.get("title", "")[:40]))
+            self["backdropImg"].hide()
+            self._current_backdrop_path = ""
+        else:
             path = plugin_imagecache.getCachedImage(target_url)
             if path and path != self._current_backdrop_path:
                 try:
                     self["backdropImg"].instance.setPixmapFromFile(path)
                     self["backdropImg"].show()
                     self._current_backdrop_path = path
-                except: pass
+                except Exception as e:
+                    my_log("_updateBackdrop: setPixmapFromFile failed for {}: {}".format(path, e))
             elif not path:
                 plugin_imagecache.requestImageAsyncPriority(target_url)
                 if poster_url:
-                    poster_path = plugin_imagecache.getCachedImage(poster_url, target_size=(POSTER_W, POSTER_H))
+                    poster_path = plugin_imagecache.getCachedImage(poster_url, target_size=(340, 510))
                     if poster_path and poster_path != self._current_backdrop_path:
                         try:
                             self["backdropImg"].instance.setPixmapFromFile(poster_path)
                             self["backdropImg"].show()
                             self._current_backdrop_path = poster_path
-                        except: pass
-        else:
-            self["backdropImg"].hide()
-            self._current_backdrop_path = ""
+                        except Exception as e:
+                            my_log("_updateBackdrop: poster fallback setPixmapFromFile failed for {}: {}".format(poster_path, e))
+                    else:
+                        my_log("_updateBackdrop: waiting on cache for '{}' (backdrop_url={}, poster cached={})".format(
+                            item.get("title", "")[:40], bool(backdrop_url), bool(poster_path)))
 
         if not skip_tmdb and _tmdb_enabled() and item.get("title"):
             current_token = self._tmdb_token
@@ -958,7 +980,7 @@ class AdvancedArabicPlayerHome(Screen):
         if self._layout_style == "grid":
             self._updatePosterPixmaps()
             self._updateGridFooter()
-            self._updateBackdrop(skip_tmdb=True)  # Update fanart without doing TMDB API calls (prevents UI freeze)
+            self._updateBackdrop(skip_tmdb=True)  # no-op for grid (early-returns), kept for symmetry
         else:
             # FIX: Only update the poster pixmaps, DO NOT trigger TMDB API calls on the 600ms timer!
             for logical_slot in range(self.carousel_slots):
@@ -1054,7 +1076,7 @@ class AdvancedArabicPlayerHome(Screen):
         if content_items:
             self._items = content_items
             self._display_mode = "poster"
-            
+
             if self._layout_style == "carousel":
                 if self._page > 1 and self._source == "category":
                     content_items.insert(0, {"title": "Previous Page", "_is_prev_page": True, "type": "movie"})
@@ -1063,7 +1085,7 @@ class AdvancedArabicPlayerHome(Screen):
 
                 has_prev = self._page > 1 and self._source == "category"
                 has_next = getattr(self, "_next_page_url", None) is not None
-                
+
                 if getattr(self, "_focus_end", False):
                     if has_next:
                         self.index = len(content_items) - 2
@@ -1077,7 +1099,7 @@ class AdvancedArabicPlayerHome(Screen):
                         self.index = 0
             else:
                 self.index = 0
-                
+
             self.widget_map = list(range(self.carousel_slots))
             self._showPosterMode()
             if self._layout_style == "grid":
@@ -1091,6 +1113,19 @@ class AdvancedArabicPlayerHome(Screen):
             self._artworkPollTimer.stop()
             self.carouselFocusBlinkTimer.stop()
             self.gridFocusBlinkTimer.stop()
+
+            # FIX: carousel/grid fanart & text widgets were never hidden
+            # here, so navigating from carousel view straight to a
+            # category/list screen (e.g. via Back) left the title, meta,
+            # plot text, and dimmed backdrop overlay stuck on screen with
+            # no image behind them.
+            self["backdropImg"].hide()
+            self["shade_overlay"].hide()
+            self["content_title"].setText("")
+            self["info_meta"].setText("")
+            self["info_plot"].setText("")
+            self._current_backdrop_path = ""
+
             self["poster_grid"].hide()
             for i in range(self.carousel_slots):
                 self["cfocus%d" % i].hide()
@@ -1139,10 +1174,11 @@ class AdvancedArabicPlayerHome(Screen):
         if is_new:
             self._cat_url = url
             self._page = 1
-            self._page_history = [url]
+            self._page_history = [(url, self._page)]
         else:
-            if url not in self._page_history:
-                self._page_history.append(url)
+            key = (url, self._page)
+            if key not in self._page_history:
+                self._page_history.append(key)
                 if self._site not in ["egydead", "egydead_coupons", "fasel", "faselhdx"]:
                     self._page += 1
                     
@@ -1234,10 +1270,10 @@ class AdvancedArabicPlayerHome(Screen):
 
     def _prevPage(self):
         if len(self._page_history) > 1:
-            self._page_history.pop()  # Remove current page URL
-            prev_url = self._page_history[-1]  # Get previous page URL
+            self._page_history.pop()  # Remove current page entry
+            prev_url, prev_page = self._page_history[-1]  # Get previous (url, page)
             cat_name = getattr(self, "_cat_name", "")
-            self._page -= 1
+            self._page = prev_page
             if self._layout_style == "carousel":
                 self._focus_end = True
             # Load previous page directly without adding to history again
@@ -2074,7 +2110,13 @@ class AdvancedArabicPlayerDetail(Screen):
         elif self._item.get("poster"):
             poster_url = self._item["poster"]
         if poster_url:
-            self._downloadPoster(poster_url)
+            # FIX: was calling self._downloadPoster(poster_url) directly on
+            # the main thread here, which does a synchronous network fetch
+            # (up to 10s timeout) and would freeze the whole screen. Route
+            # through a background thread like the _onLoaded call site does.
+            threading.Thread(
+                target=self._downloadPoster, args=(poster_url,), daemon=True
+            ).start()
         else:
             callInMainThread(self["poster"].hide)
 
@@ -2085,10 +2127,21 @@ class AdvancedArabicPlayerDetail(Screen):
 
             import urllib.request as urllib2
 
+            # FIX: reading self["poster"].instance.size() used to happen
+            # deep inside this function while running on a background
+            # thread, alongside a callInMainThread() call that also read
+            # the same instance concurrently with the main thread mutating
+            # it. Read it once, defensively, up front instead.
+            try:
+                w = self["poster"].instance.size().width()
+                h = self["poster"].instance.size().height()
+            except Exception:
+                w, h = 375, 555  # fallback to skin default poster size
+
             cached = _get_cached_poster(url)
             if cached:
                 my_log("_downloadPoster (detail): using cached file for {}".format(url))
-                callInMainThread(self.picLoad.setPara, (self["poster"].instance.size().width(), self["poster"].instance.size().height(), 1, 1, 0, 1, "#000000"))
+                callInMainThread(self.picLoad.setPara, (w, h, 1, 1, 0, 1, "#000000"))
                 callInMainThread(self.picLoad.startDecode, cached)
                 return
 
@@ -2106,7 +2159,7 @@ class AdvancedArabicPlayerDetail(Screen):
             if not cache_path:
                 self._tmp_posters.append(save_path)
             my_log("_downloadPoster (detail): saved to {}, handing to picLoad".format(save_path))
-            callInMainThread(self.picLoad.setPara, (self["poster"].instance.size().width(), self["poster"].instance.size().height(), 1, 1, 0, 1, "#000000"))
+            callInMainThread(self.picLoad.setPara, (w, h, 1, 1, 0, 1, "#000000"))
             callInMainThread(self.picLoad.startDecode, save_path)
         except Exception as e:
             my_log("_downloadPoster error: {} (URL: {})".format(e, url))
@@ -2766,6 +2819,10 @@ class AdvancedArabicPlayerSimplePlayer(Screen):
             _tot = self._total_secs
             if _tot > 0:
                 target = min(target, _tot - 3)
+            # FIX: min(target, _tot - 3) can push target negative again for
+            # very short clips (or a momentarily misreported _total_secs) -
+            # clamp back to zero before seeking, matching __onExit's guard.
+            target = max(0, target)
             sk.seekTo(target * 90000)
             _GLOBAL_LAST_SEEK_TARGET = target
             _GLOBAL_PLAY_START_POS = max(0, target - 2)

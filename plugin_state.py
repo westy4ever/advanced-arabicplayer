@@ -21,7 +21,7 @@ import time
 from extractors.base import log as _log
 
 _PLUGIN_OWNER = "ArabicPlayer Team"
-_DEFAULT_TMDB_API_KEY = "f564cfc4146dab2b651330932a4782c7"
+_DEFAULT_TMDB_API_KEY = "46b050dc88e3c52e9d1bca4b656036e4"
 
 PLUGIN_PATH = os.path.dirname(__file__)
 

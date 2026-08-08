@@ -33,6 +33,15 @@ try:
 except Exception:
     from urllib.parse import urlparse
 
+try:
+    from extractors.base import log as _log
+except Exception:
+    def _log(msg):
+        try:
+            print("[ArabicPlayer] {}".format(msg))
+        except Exception:
+            pass
+
 
 CACHE_BASE_HDD = "/media/hdd/AdvancedArabicPlayer/cache"
 CACHE_BASE_TMP = "/tmp/AdvancedArabicPlayer/cache"
@@ -111,7 +120,8 @@ def writeFileAtomic(path, data):
             pass
         os.rename(tmp, path)
         return True
-    except Exception:
+    except Exception as e:
+        _log("plugin_imagecache: writeFileAtomic FAILED for {}: {}".format(path, e))
         try:
             if os.path.exists(tmp):
                 os.remove(tmp)
@@ -138,8 +148,9 @@ def downloadUrl(url, timeout=8):
         data = response.read()
         if data:
             return data
-    except Exception:
-        pass
+        _log("plugin_imagecache: downloadUrl got empty body for {}".format(url))
+    except Exception as e:
+        _log("plugin_imagecache: downloadUrl FAILED for {}: {}".format(url, e))
 
     # If the URL is WebP, try requesting the .jpg version - many
     # WordPress/CDN sites serve both formats at the same path.
@@ -159,8 +170,9 @@ def downloadUrl(url, timeout=8):
                 data = response.read()
                 if data:
                     return data
-        except Exception:
-            pass
+                _log("plugin_imagecache: webp->jpg fallback got empty body for {}".format(jpg_url))
+        except Exception as e:
+            _log("plugin_imagecache: webp->jpg fallback FAILED for {}: {}".format(url, e))
 
     return None
 
@@ -206,10 +218,11 @@ def resizeCover(data, target_size):
         fitted.save(out, format="JPEG", quality=88)
         return out.getvalue()
         
-    except Exception:
+    except Exception as e:
         # PIL IS installed, but failed to decode/load/resize the data.
         # This means the data is genuinely corrupt or truncated.
         # Return None to signal failure so the caller SKIPS caching it.
+        _log("plugin_imagecache: resizeCover FAILED (corrupt/truncated image data): {}".format(e))
         return None
 
 
@@ -300,14 +313,21 @@ def _async_worker_loop():
                         processed_data = resizeCover(data, target_size)
                     else:
                         processed_data = data
-                        
+
                     # Only cache if resizeCover didn't signal corruption (None)
                     if processed_data is not None:
-                        writeFileAtomic(cache_path, processed_data)
-            except Exception:
-                pass
+                        ok = writeFileAtomic(cache_path, processed_data)
+                        if not ok:
+                            _log("plugin_imagecache: cache write failed, image will be re-downloaded next poll: {}".format(url))
+                    else:
+                        _log("plugin_imagecache: skipping cache write (corrupt image data) for {}".format(url))
+                else:
+                    _log("plugin_imagecache: no data downloaded for {}, skipping cache".format(url))
+            except Exception as e:
+                _log("plugin_imagecache: worker error for {}: {}".format(url, e))
             _mark_async_done(cache_path)
-    except Exception:
+    except Exception as e:
+        _log("plugin_imagecache: worker loop crashed: {}".format(e))
         try:
             with _ASYNC_LOCK:
                 _ASYNC_WORKERS = max(0, int(_ASYNC_WORKERS) - 1)

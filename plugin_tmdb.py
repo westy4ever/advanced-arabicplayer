@@ -89,9 +89,19 @@ def _tmdb_request(path, params=None):
         try:
             raw, _ = base_fetch(url, referer="https://www.themoviedb.org/", extra_headers={"Accept": "application/json"})
             if not raw:
+                _log("TMDb: empty HTTP body for {} [{}]".format(path, language))
                 continue
+            _log("TMDb RAW response [{}] query={}: {}".format(
+                language, payload.get("query"), raw[:300]))
             data = json.loads(raw)
             if isinstance(data, dict):
+                if data.get("status_code"):
+                    _log("TMDb API ERROR for {} [{}]: status_code={} message={}".format(
+                        path, language, data.get("status_code"), data.get("status_message")))
+                    continue
+                if data.get("results") is not None and len(data.get("results")) == 0:
+                    _log("TMDb: zero results for {} [{}] query={}".format(
+                        path, language, payload.get("query")))
                 if data.get("overview") or data.get("results") or language == "en-US":
                     return data
         except Exception as e:
@@ -109,9 +119,15 @@ def _tmdb_request_language(path, language="ar", params=None, accept_any=False):
     try:
         raw, _ = base_fetch(url, referer="https://www.themoviedb.org/", extra_headers={"Accept": "application/json"})
         if not raw:
+            _log("TMDb: empty HTTP body for {} [{}]".format(path, language))
             return None
+        _log("TMDb RAW response (lang-request) [{}]: {}".format(language, raw[:300]))
         data = json.loads(raw)
         if not isinstance(data, dict):
+            return None
+        if data.get("status_code"):
+            _log("TMDb API ERROR for {} [{}]: status_code={} message={}".format(
+                path, language, data.get("status_code"), data.get("status_message")))
             return None
         if accept_any or data.get("overview") or data.get("results"):
             return data
@@ -159,19 +175,28 @@ def _tmdb_pick_best(results, query, year=""):
     target_year = (year or "")[:4]
     scored = []
     for result in results or []:
+        # Get both localized title and original title
         title = result.get("title") or result.get("name") or ""
+        original_title = result.get("original_title") or result.get("original_name") or ""
+        
         title_norm = _normalize_query(title)
+        original_norm = _normalize_query(original_title)
+        
         score = 9
-        if title_norm == query_norm:
+        # Check exact match against either title
+        if query_norm == title_norm or query_norm == original_norm:
             score = 0
-        elif title_norm.startswith(query_norm):
+        elif title_norm.startswith(query_norm) or original_norm.startswith(query_norm):
             score = 1
-        elif query_norm and query_norm in title_norm:
+        elif (query_norm and query_norm in title_norm) or (query_norm and query_norm in original_norm):
             score = 2
+            
         release = str(result.get("release_date") or result.get("first_air_date") or "")
         if target_year and release[:4] == target_year:
             score -= 1
-        scored.append((score, title.lower(), result))
+            
+        # Sort by score, then by original title to avoid weird alphabetical mismatches
+        scored.append((score, (original_title or title).lower(), result))
     scored.sort(key=lambda row: (row[0], row[1]))
     return scored[0][2] if scored else None
 
@@ -188,6 +213,18 @@ def _tmdb_search_metadata(title, year="", item_type="movie"):
     # 2. Fetch from TMDB API
     media_kind = _tmdb_media_kind(item_type)
 
+    # Extract a bare trailing year (e.g. "The Last House 2026" -> year=2026)
+    # so it can be used as a ranking hint instead of polluting the text
+    # search itself. TMDb's title search matches literal title text, and
+    # scraped titles frequently have the release year appended without
+    # parentheses - a movie is never actually titled "Movie Name 2026" in
+    # TMDb, so leaving the year in the query text reliably produces zero
+    # results even for well-known films.
+    if not year:
+        year_m = re.search(r'\b(19\d{2}|20\d{2})\s*$', title.strip())
+        if year_m:
+            year = year_m.group(1)
+
     variants = []
     seen_normalized = set()
 
@@ -201,8 +238,12 @@ def _tmdb_search_metadata(title, year="", item_type="movie"):
         seen_normalized.add(norm)
         variants.append(text)
 
+    # Strip a bare trailing year (no parens) first, so the very first
+    # variant we try is already year-free text.
+    no_year = re.sub(r'\s*\b(19\d{2}|20\d{2})\s*$', '', title).strip()
+    _add_variant(no_year)
     _add_variant(title)
-    simple = re.sub(r"\s*\(\d{4}\)\s*$", "", title).strip()
+    simple = re.sub(r"\s*\(\d{4}\)\s*$", "", no_year).strip()
     _add_variant(simple)
     plain = re.sub(r"[:|_\-]+", " ", simple).strip()
     _add_variant(plain)
@@ -238,6 +279,8 @@ def _tmdb_search_metadata(title, year="", item_type="movie"):
             break
             
     if not best:
+        _log("TMDb: no match found for title='{}' year='{}' type='{}' after trying {} variant(s)".format(
+            title, year, item_type, len(variants)))
         return None
         
     detail_ar = _tmdb_request_language(

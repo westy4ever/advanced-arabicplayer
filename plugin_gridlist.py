@@ -244,6 +244,12 @@ class PosterCardGrid(_BaseCardGrid):
                 caption = u"{} {}".format(title, year).strip() if year else title
             
             cap_y = cy + POSTER_H + 2
+
+            # FIX: the caption text entry's backcolor alone was rendering
+            # transparent in this skin engine - explicitly fill the caption
+            # rect with solid opaque black first (same trick already used
+            # for the poster area above), then draw the text on top.
+            row.append(MultiContentEntryText(pos=(cx, cap_y), size=(POSTER_W, POSTER_CAPTION_H), font=0, text="", color=0, backcolor="#FF000000", flags=0))
             row.append(MultiContentEntryText(pos=(cx, cap_y), size=(POSTER_W, POSTER_CAPTION_H), font=0, text=caption, color=_G_CLR["text"], backcolor="#FF000000", flags=RT_HALIGN_CENTER | RT_VALIGN_CENTER))
         return row
 
