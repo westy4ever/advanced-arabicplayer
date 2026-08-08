@@ -381,8 +381,8 @@ class FaselhdRipExtractor(BaseExtractor):
             return url, quality, self.BASE_URL
     
         from .base import extract_stream as base_extract_stream
-        stream_url, quality, ref = base_extract_stream(url)
+        stream_url, quality, ref, variants = base_extract_stream(url)
         if stream_url:
             return stream_url, quality, ref
-    
+
         return None, "", self.BASE_URL

@@ -310,6 +310,7 @@ def fetch(url, referer=None, extra_headers=None, post_data=None):
     - Cookie jar (shared session)
     - UI feedback flags (proxy used / curl failed & proxy missing)
     """
+    global _opener
     set_proxy_used(False)
     set_curl_failed_needs_proxy(False)
 
@@ -318,7 +319,7 @@ def fetch(url, referer=None, extra_headers=None, post_data=None):
     parsed_quick = urlparse(url)
     domain_quick = parsed_quick.netloc.lower()
     cf_domains = ("egydead", "wecima", "mycima", "topcinema", "arabseed",
-                "shaheed", "shahid", "fasel", "akwam", "akoam")
+                "shaheed", "shahid", "fasel", "akwam", "akoam", "themoviedb")
     if any(d in domain_quick for d in cf_domains):
         use_cffi = True
 
@@ -2471,7 +2472,12 @@ def extract_stream(url):
         return main_url, q, ref, []
 
     # ─── RESOLVE VIA HOST RESOLVERS ────────────────────────────────────────
-    _, final_ref = fetch(main_url, referer=piped_headers.get("Referer"))
+    # NOTE: a single fetch() call is deliberately used to obtain final_ref
+    # here; resolve_host() below will typically fetch main_url again inside
+    # its dispatched resolver (this duplicate request is a known tradeoff of
+    # the current resolver architecture, not something this call adds on
+    # top of).
+    html, final_ref = fetch(main_url, referer=piped_headers.get("Referer"))
     stream = resolve_host(main_url, referer=piped_headers.get("Referer"))
     if not stream:
         log("resolve_host failed, trying iframe chain")
